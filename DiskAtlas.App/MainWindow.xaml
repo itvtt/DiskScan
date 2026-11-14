@@ -337,9 +337,10 @@
                     <local:TreemapControl x:Name="Treemap" Grid.Row="1" Margin="5" NodeSelected="Treemap_NodeSelected" FolderInvoked="Treemap_FolderInvoked"/>
                 </Grid>
             </Border>
-            <Grid Grid.Row="7" Margin="14,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <Grid Grid.Row="7" Margin="14,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <TextBlock x:Name="StatusText" Text="Ctrl+F 검색 · F5 분석 · Esc 취소" Foreground="{StaticResource MutedBrush}" FontSize="11" VerticalAlignment="Center"/>
                 <TextBlock x:Name="SelectionText" Grid.Column="1" Foreground="{StaticResource AccentBrush}" FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="520"/>
+                <TextBlock Grid.Column="2" Margin="14,0,0,0" VerticalAlignment="Center" FontSize="10" Foreground="{StaticResource MutedBrush}" IsHitTestVisible="False" Text="made by jy01.ahn"/>
             </Grid>
         </Grid>
     </Border>
