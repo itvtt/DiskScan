@@ -80,7 +80,7 @@ internal sealed class InstallerService
         }
         catch (IOException exception)
         {
-            throw new IOException("DiskAtlas가 실행 중일 수 있습니다. 앱을 닫은 뒤 제거를 다시 시도해 주세요.", exception);
+            throw new IOException("DiskScan이 실행 중일 수 있습니다. 앱을 닫은 뒤 제거를 다시 시도해 주세요.", exception);
         }
     }
 

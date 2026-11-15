@@ -30,7 +30,7 @@ internal sealed class BootstrapCoordinator
 
         if (receipt is null || !receipt.Fingerprint.Equals(source.Fingerprint, StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException("현재 DiskAtlas 패키지가 설치되지 않았습니다. --install 옵션으로 다시 설치해 주세요.");
+            throw new InvalidOperationException("현재 DiskScan 패키지가 설치되지 않았습니다. --install 옵션으로 다시 설치해 주세요.");
         }
 
         ValidateReceiptPath(receipt);

@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         xmlns:local="clr-namespace:DiskAtlas.App"
-        Title="DiskAtlas" Width="1280" Height="850" MinWidth="1050" MinHeight="700"
+        Title="DiskScan" Width="1280" Height="850" MinWidth="1050" MinHeight="700"
         Background="{StaticResource CanvasBrush}" Foreground="{StaticResource TextBrush}" FontFamily="Segoe UI Variable Text, Malgun Gothic, Segoe UI" WindowStyle="None" ResizeMode="CanResize" Icon="/DiskAtlas;component/Assets/DiskAtlas.ico">
     <Window.Resources>
         <Style x:Key="CancelActionButton" TargetType="Button" BasedOn="{StaticResource ActionButton}">
@@ -32,7 +32,7 @@
                 <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="15,0">
                     <Image Source="/DiskAtlas;component/Assets/DiskAtlas.png" Width="23" Height="23" Margin="0,0,10,0"/>
-                    <TextBlock Text="D I S K A T L A S" Foreground="White" FontSize="13" FontWeight="Bold"/>
+                    <TextBlock Text="D I S K S C A N" Foreground="White" FontSize="13" FontWeight="Bold"/>
                     <Border Background="#2B4563" CornerRadius="4" Padding="7,2" Margin="10,0,0,0"><TextBlock Text="디스크 분석" FontSize="9" Foreground="#83E6DA"/></Border>
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" shell:WindowChrome.IsHitTestVisibleInChrome="True">

@@ -8,6 +8,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>DiskAtlas</AssemblyName>
+    <AssemblyTitle>DiskScan</AssemblyTitle>
+    <Product>DiskScan</Product>
     <RootNamespace>DiskAtlas.App</RootNamespace>
     <ApplicationIcon>Assets\DiskAtlas.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>

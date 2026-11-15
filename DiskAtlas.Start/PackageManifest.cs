@@ -31,7 +31,7 @@ public sealed class PackageManifest
         PathPolicy.RejectExistingReparsePoints(root);
         if (!Directory.Exists(root))
         {
-            throw new DirectoryNotFoundException("DiskAtlas 앱 패키지 폴더를 찾을 수 없습니다.");
+            throw new DirectoryNotFoundException("DiskScan 앱 패키지 폴더를 찾을 수 없습니다.");
         }
 
         string manifestPath = Path.Combine(root, "package.sha256");

@@ -23,8 +23,8 @@ internal static class Program
         catch (Exception exception)
         {
             MessageBox.Show(
-                $"DiskAtlas를 시작하지 못했습니다.\n\n{exception.Message}",
-                "DiskAtlas",
+                $"DiskScan을 시작하지 못했습니다.\n\n{exception.Message}",
+                "DiskScan",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
             return 1;
