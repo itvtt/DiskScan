@@ -1,8 +1,8 @@
 # DiskScan
 
-> **이름**: 런처·창 제목에 보이는 이름과 저장소·폴더 이름은 **DiskScan** 입니다. 코드와 설치 이름은 예전 이름 **DiskAtlas** 그대로입니다: 솔루션 `DiskAtlas.sln`, 프로젝트 `DiskAtlas.App`·`DiskAtlas.Core`·`DiskAtlas.Start`(네임스페이스 `DiskAtlas`), 실행 파일 `DiskAtlas.exe`, 설치 폴더 `%LOCALAPPDATA%\Programs\DiskAtlas`, 런처 id `diskatlas`. 설치·자체 업데이트가 이 이름을 따르므로 바꾸지 않습니다. 사용자가 "DiskScan"이라고 하면 이 앱입니다.
+> **이름**: 런처·창 제목·저장소·폴더·코드·실행 파일·설치 이름 모두 **DiskScan** 입니다 (2026-11-16 예전 이름 DiskAtlas 에서 모두 바꿈): 솔루션 `DiskScan.sln`, 프로젝트 `DiskScan.App`·`DiskScan.Core`·`DiskScan.Start`(네임스페이스 `DiskScan`), 실행 파일 `DiskScan.exe`, 설치 폴더 `%LOCALAPPDATA%\Programs\DiskScan`, 런처 id `diskscan`. 예전 이름으로 설치된 것은 i-luncher 가 업데이트할 때 새 이름으로 옮깁니다(앱 목록의 `formerInstallNames`).
 
-Windows용 C# WPF 디스크 분석·파일 검색 도구입니다. i-luncher 로 설치·업데이트합니다: main 에 push 하면 이 저장소의 러너가 `.github\workflows\release.yml` 로 릴리스를 만들고(`build\Publish-App.ps1`), 런처가 설치하며, 설치된 앱은 시작할 때 스스로 업데이트합니다. 릴리스에는 `DiskAtlas.App`(관리자 권한 앱, 실행할 때 UAC)만 들어갑니다. 아래 "관리자 실행 등록"의 실행 도우미(`DiskAtlas.Start`)·예약 작업은 예전 독립 배포용이며 지금 릴리스에는 들어가지 않습니다.
+Windows용 C# WPF 디스크 분석·파일 검색 도구입니다. i-luncher 로 설치·업데이트합니다: main 에 push 하면 이 저장소의 러너가 `.github\workflows\release.yml` 로 릴리스를 만들고(`build\Publish-App.ps1`), 런처가 설치하며, 설치된 앱은 시작할 때 스스로 업데이트합니다. 릴리스에는 `DiskScan.App`(관리자 권한 앱, 실행할 때 UAC)만 들어갑니다. 아래 "관리자 실행 등록"의 실행 도우미(`DiskScan.Start`)·예약 작업은 예전 독립 배포용이며 지금 릴리스에는 들어가지 않습니다.
 
 ## 사용
 
@@ -34,7 +34,7 @@ Windows용 C# WPF 디스크 분석·파일 검색 도구입니다. i-luncher 로
 
 내용 검색은 텍스트·코드·로그, 텍스트로 판별된 기타 확장자와 DOCX/XLSX/PPTX의 XML 텍스트를 지원합니다. UTF-8 및 BOM이 있는 UTF-16/UTF-32를 판별합니다. **PDF, 구형 DOC/XLS/PPT, 이미지 OCR과 CP949 자동 판별은 지원하지 않습니다.** Office 문서는 XML 압축 해제 합계 256MiB 또는 ZIP 항목 20,000개를 넘으면 건너뜁니다. 일반 텍스트는 고정 크기 버퍼로 읽으며 작은 용량 제한으로 잘라 검색하지 않습니다.
 
-최초 실행 때 한 번 Windows 관리자 승인(UAC)을 받아 보호된 설치 폴더에 앱을 설치하고 현재 계정용 실행 작업을 등록합니다. 이후 런처 아이콘이나 `dist/win-x64/DiskAtlas.exe`로 실행하면 등록된 작업을 통해 관리자 권한으로 열립니다. 앱을 새로 게시해 내용이 바뀌면 다음 실행 때 업데이트 승인이 필요합니다. Windows 전체 UAC 설정은 변경하지 않습니다.
+최초 실행 때 한 번 Windows 관리자 승인(UAC)을 받아 보호된 설치 폴더에 앱을 설치하고 현재 계정용 실행 작업을 등록합니다. 이후 런처 아이콘이나 `dist/win-x64/DiskScan.exe`로 실행하면 등록된 작업을 통해 관리자 권한으로 열립니다. 앱을 새로 게시해 내용이 바뀌면 다음 실행 때 업데이트 승인이 필요합니다. Windows 전체 UAC 설정은 변경하지 않습니다.
 
 전체 로컬 NTFS 드라이브에서 MFT 고속 경로를 시도하며, 지원 조건이 맞지 않으면 병렬 폴더 스캔으로 전환합니다. 읽지 못한 항목이나 연결 폴더의 생략 안내, 분석 상세 버튼은 화면에 표시하지 않습니다. 실제 사용 엔진은 요약 카드에서 확인할 수 있습니다. 중복 파일 탭은 선택한 파일을 휴지통으로 보내고, **저장소 최적화** 탭은 검사 후 명시적으로 선택한 임시폴더 파일을 영구 삭제합니다.
 
@@ -59,17 +59,17 @@ Downloads, `bin` 폴더, 브라우저 데이터, 사용자 프로필 전반, 임
 ## 프로젝트 독립성
 
 ```text
-DiskAtlas/
-├─ DiskAtlas.sln
-├─ DiskAtlas.App/         # WPF 화면, 공간 지도, 전용 아이콘
-├─ DiskAtlas.Start/       # 최초 설치·업데이트·등록된 관리자 실행
-├─ DiskAtlas.Start.Checks/ # 패키지·경로·작업 정의 검사
-├─ DiskAtlas.Core/        # 디스크 스캐너, 파일 내용 검색, 중복 판별·삭제 검증
-├─ DiskAtlas.Checks/      # 파일 데이터와 성능 검사
-├─ DiskAtlas.UiChecks/    # WPF 화면·동작 검사
-├─ DiskAtlas.OptimizationChecks/ # 저장소 최적화 정책·삭제 검사
+DiskScan/
+├─ DiskScan.sln
+├─ DiskScan.App/         # WPF 화면, 공간 지도, 전용 아이콘
+├─ DiskScan.Start/       # 최초 설치·업데이트·등록된 관리자 실행
+├─ DiskScan.Start.Checks/ # 패키지·경로·작업 정의 검사
+├─ DiskScan.Core/        # 디스크 스캐너, 파일 내용 검색, 중복 판별·삭제 검증
+├─ DiskScan.Checks/      # 파일 데이터와 성능 검사
+├─ DiskScan.UiChecks/    # WPF 화면·동작 검사
+├─ DiskScan.OptimizationChecks/ # 저장소 최적화 정책·삭제 검사
 ├─ launcher.app.json     # 런처 등록 정보
-└─ dist/win-x64/          # DiskAtlas.exe 실행 도우미 + app/ 실제 앱
+└─ dist/win-x64/          # DiskScan.exe 실행 도우미 + app/ 실제 앱
 ```
 
 `parapara`, `FolderCompareWPF`, `SwiftCopy`, 런처에 대한 소스·DLL·프로젝트 참조가 없습니다. 자체 솔루션에서 따로 개발할 수 있습니다. `parapara/diskcheck`는 시스템 검색 제외 정책과 기존 사용 흐름의 참고 자료로만 사용했습니다.
@@ -78,38 +78,38 @@ DiskAtlas/
 
 Windows와 .NET 10 SDK가 필요합니다.
 
-Visual Studio에서는 `DiskAtlas.sln`을 열고 `DiskAtlas.App`을 시작 프로젝트로 실행합니다. `DiskAtlas.Core`는 앱 내부 엔진 라이브러리입니다.
+Visual Studio에서는 `DiskScan.sln`을 열고 `DiskScan.App`을 시작 프로젝트로 실행합니다. `DiskScan.Core`는 앱 내부 엔진 라이브러리입니다.
 
 ```powershell
-dotnet build .\DiskAtlas.sln -c Release
+dotnet build .\DiskScan.sln -c Release
 # 앱의 dotnet run은 관리자 터미널에서 실행
-dotnet run --project .\DiskAtlas.App -c Release
-dotnet run --project .\DiskAtlas.Checks -c Release
-dotnet run --project .\DiskAtlas.Start.Checks -c Release
-dotnet run --project .\DiskAtlas.Checks -c Release -- --benchmark
-dotnet run --project .\DiskAtlas.UiChecks -c Release
-dotnet run --project .\DiskAtlas.OptimizationChecks -c Release
-dotnet run --project .\DiskAtlas.RecycleChecks -c Release
+dotnet run --project .\DiskScan.App -c Release
+dotnet run --project .\DiskScan.Checks -c Release
+dotnet run --project .\DiskScan.Start.Checks -c Release
+dotnet run --project .\DiskScan.Checks -c Release -- --benchmark
+dotnet run --project .\DiskScan.UiChecks -c Release
+dotnet run --project .\DiskScan.OptimizationChecks -c Release
+dotnet run --project .\DiskScan.RecycleChecks -c Release
 
-# 릴리스 zip (러너가 하는 것과 같음): out\DiskAtlas-win-x64.zip
-powershell -NoProfile -ExecutionPolicy Bypass -File build\Publish-App.ps1 -Project DiskAtlas.App\DiskAtlas.App.csproj
+# 릴리스 zip (러너가 하는 것과 같음): out\DiskScan-win-x64.zip
+powershell -NoProfile -ExecutionPolicy Bypass -File build\Publish-App.ps1 -Project DiskScan.App\DiskScan.App.csproj
 ```
 
 성능 검사는 임시 폴더에 파일 100,000개를 생성하므로 일반 검사와 분리되어 있습니다. 측정에서 파일 생성 시간은 제외하고 결과 개수와 총 바이트를 함께 검사합니다. 결과와 측정 환경은 `artifacts`에 기록합니다.
 
-`DiskAtlas.RecycleChecks`는 직접 만든 임시 파일만 사용해 실제 Windows 휴지통 이동과 보관본 유지를 확인합니다. 휴지통으로 이동된 시험 파일은 내용 확인을 위해 남겨 두며 기존 휴지통 항목은 변경하지 않습니다. 중복 파일 기능의 최신 검증은 [중복 파일 검증 보고서](../artifacts/diskatlas-duplicates-verification.md)에 기록합니다.
+`DiskScan.RecycleChecks`는 직접 만든 임시 파일만 사용해 실제 Windows 휴지통 이동과 보관본 유지를 확인합니다. 휴지통으로 이동된 시험 파일은 내용 확인을 위해 남겨 두며 기존 휴지통 항목은 변경하지 않습니다. 중복 파일 기능의 최신 검증은 [중복 파일 검증 보고서](../artifacts/diskscan-duplicates-verification.md)에 기록합니다.
 
 ## 관리자 실행 등록
 
-(예전 독립 배포용, 지금 릴리스에는 없음) 독립 배포본은 게시 폴더 최상위의 `DiskAtlas.exe` 실행 도우미를 사용합니다. `app/DiskAtlas.exe`는 실제 관리자 앱이므로 직접 열면 매번 UAC가 표시될 수 있습니다. i-luncher 로 설치한 앱은 이 도우미나 예약 작업을 쓰지 않습니다.
+(예전 독립 배포용, 지금 릴리스에는 없음) 독립 배포본은 게시 폴더 최상위의 `DiskScan.exe` 실행 도우미를 사용합니다. `app/DiskScan.exe`는 실제 관리자 앱이므로 직접 열면 매번 UAC가 표시될 수 있습니다. i-luncher 로 설치한 앱은 이 도우미나 예약 작업을 쓰지 않습니다.
 
-설치 위치는 `%ProgramFiles%\i-luncher\DiskAtlas\<계정 SID>\`이며, 작업 스케줄러에는 `\i-luncher\DiskAtlas-<계정 SID>`가 등록됩니다. 설치된 파일은 일반 사용자에게 읽기·실행만 허용하고, 작업은 이 보호된 앱만 실행합니다. 게시 파일의 SHA-256 목록을 검증한 뒤 설치하며, 새 버전은 별도 폴더에 둡니다. 관리자 그룹에 속한 현재 계정의 승격을 사용합니다.
+설치 위치는 `%ProgramFiles%\i-luncher\DiskScan\<계정 SID>\`이며, 작업 스케줄러에는 `\i-luncher\DiskScan-<계정 SID>`가 등록됩니다. 설치된 파일은 일반 사용자에게 읽기·실행만 허용하고, 작업은 이 보호된 앱만 실행합니다. 게시 파일의 SHA-256 목록을 검증한 뒤 설치하며, 새 버전은 별도 폴더에 둡니다. 관리자 그룹에 속한 현재 계정의 승격을 사용합니다.
 
 ```powershell
 # 등록·업데이트만 수행하고 앱은 열지 않음
-Start-Process .\dist\win-x64\DiskAtlas.exe -ArgumentList '--install' -Wait
+Start-Process .\dist\win-x64\DiskScan.exe -ArgumentList '--install' -Wait
 # 현재 계정의 실행 작업과 보호된 설치 파일 제거 (관리자 승인 필요)
-Start-Process .\dist\win-x64\DiskAtlas.exe -ArgumentList '--uninstall' -Wait
+Start-Process .\dist\win-x64\DiskScan.exe -ArgumentList '--uninstall' -Wait
 ```
 
 등록 해제해도 프로젝트의 소스와 게시 폴더는 유지됩니다. 작업 폴더가 네트워크 드라이브에 있어도 최초 설치 도우미는 로컬 임시 설치 폴더에서 실행됩니다.
@@ -135,7 +135,7 @@ C: 검사에는 기존 파일과 테스트 자료가 포함되며 접근할 수 
 
 파일 데이터·검색·MFT 합성 레코드 검사 16개와 화면 검사 41개가 통과했습니다. 화면 검사에는 AND/OR와 이름+본문 조합, 잘못된 조건의 사전 거부, 시스템 파일 검색 제외, 색상 범례 강조, 실제 바이트 정렬, 취소 후 기존 결과 보존, 할당 크기 전환, 지도 생략 면적 비율과 희소 파일 처리, 10만 파일의 화면 반영이 포함됩니다. 새 지도 적용 후 10만 파일 분석·화면 반영은 1.329초였고 UI 타이머의 최대 지연은 745ms였습니다([ui-scale-check.json](artifacts/ui-scale-check.json)). 큰 결과를 처음 화면에 반영할 때는 잠깐 지연될 수 있으며, 이후 지도 위의 마우스 이동은 캐시된 그림과 선택 테두리를 사용합니다.
 
-[960개 파일의 색상 지도 검사 화면](artifacts/DiskAtlas-dense-map.png)에서는 24개 폴더와 12개 파일 유형을 확인할 수 있습니다.
+[960개 파일의 색상 지도 검사 화면](artifacts/DiskScan-dense-map.png)에서는 24개 폴더와 12개 파일 유형을 확인할 수 있습니다.
 
 ## 기술 참고
 
