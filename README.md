@@ -1,10 +1,8 @@
-# DiskAtlas
+# DiskScan
 
-Windows용 C# WPF 디스크 분석·파일 검색 도구입니다. 기본 빌드는 [통합 i-luncher](../README.md)에 포함되는 라이브러리입니다. 런처에서 실행하면 같은 `i-luncher.exe --app disk-atlas`가 관리자 권한으로 열립니다. 아래 실행 도우미·예약 작업 설명은 별도 EXE를 만드는 독립 배포 방식에만 해당합니다.
+> **이름**: 런처·창 제목에 보이는 이름과 저장소·폴더 이름은 **DiskScan** 입니다. 코드와 설치 이름은 예전 이름 **DiskAtlas** 그대로입니다: 솔루션 `DiskAtlas.sln`, 프로젝트 `DiskAtlas.App`·`DiskAtlas.Core`·`DiskAtlas.Start`(네임스페이스 `DiskAtlas`), 실행 파일 `DiskAtlas.exe`, 설치 폴더 `%LOCALAPPDATA%\Programs\DiskAtlas`, 런처 id `diskatlas`. 설치·자체 업데이트가 이 이름을 따르므로 바꾸지 않습니다. 사용자가 "DiskScan"이라고 하면 이 앱입니다.
 
-Send / Receive로 소스를 동기화할 때는 상위 i-luncher 폴더의 `Build.ps1 -App disk-atlas`로 빌드하고 `Start-Launcher.cmd`로 실행하세요. 아래의 직접 빌드·실행 명령은 [로컬 작업 복사본](../README.md)에서 사용해야 원본 clone에 빌드 폴더가 생기지 않습니다. 관리자 설치 및 앱 데이터 위치는 그대로 유지됩니다.
-
-![DiskAtlas 분석 화면](artifacts/DiskAtlas-preview.png)
+Windows용 C# WPF 디스크 분석·파일 검색 도구입니다. i-luncher 로 설치·업데이트합니다: main 에 push 하면 이 저장소의 러너가 `.github\workflows\release.yml` 로 릴리스를 만들고(`build\Publish-App.ps1`), 런처가 설치하며, 설치된 앱은 시작할 때 스스로 업데이트합니다. 릴리스에는 `DiskAtlas.App`(관리자 권한 앱, 실행할 때 UAC)만 들어갑니다. 아래 "관리자 실행 등록"의 실행 도우미(`DiskAtlas.Start`)·예약 작업은 예전 독립 배포용이며 지금 릴리스에는 들어가지 않습니다.
 
 ## 사용
 
@@ -83,9 +81,9 @@ Windows와 .NET 10 SDK가 필요합니다.
 Visual Studio에서는 `DiskAtlas.sln`을 열고 `DiskAtlas.App`을 시작 프로젝트로 실행합니다. `DiskAtlas.Core`는 앱 내부 엔진 라이브러리입니다.
 
 ```powershell
-dotnet build .\DiskAtlas.sln -c Release -p:ILuncherIntegrated=false
+dotnet build .\DiskAtlas.sln -c Release
 # 앱의 dotnet run은 관리자 터미널에서 실행
-dotnet run --project .\DiskAtlas.App -c Release -p:ILuncherIntegrated=false
+dotnet run --project .\DiskAtlas.App -c Release
 dotnet run --project .\DiskAtlas.Checks -c Release
 dotnet run --project .\DiskAtlas.Start.Checks -c Release
 dotnet run --project .\DiskAtlas.Checks -c Release -- --benchmark
@@ -93,8 +91,8 @@ dotnet run --project .\DiskAtlas.UiChecks -c Release
 dotnet run --project .\DiskAtlas.OptimizationChecks -c Release
 dotnet run --project .\DiskAtlas.RecycleChecks -c Release
 
-# DiskAtlas 변경을 포함한 통합 프로그램 게시
-..\Build.ps1 -App disk-atlas
+# 릴리스 zip (러너가 하는 것과 같음): out\DiskAtlas-win-x64.zip
+powershell -NoProfile -ExecutionPolicy Bypass -File build\Publish-App.ps1 -Project DiskAtlas.App\DiskAtlas.App.csproj
 ```
 
 성능 검사는 임시 폴더에 파일 100,000개를 생성하므로 일반 검사와 분리되어 있습니다. 측정에서 파일 생성 시간은 제외하고 결과 개수와 총 바이트를 함께 검사합니다. 결과와 측정 환경은 `artifacts`에 기록합니다.
@@ -103,7 +101,7 @@ dotnet run --project .\DiskAtlas.RecycleChecks -c Release
 
 ## 관리자 실행 등록
 
-기존 독립 배포본은 게시 폴더 최상위의 `DiskAtlas.exe` 실행 도우미를 사용합니다. `app/DiskAtlas.exe`는 실제 관리자 앱이므로 직접 열면 매번 UAC가 표시될 수 있습니다. 통합 런처는 이 도우미나 예약 작업을 사용하지 않고 자체 실행 파일을 승격합니다.
+(예전 독립 배포용, 지금 릴리스에는 없음) 독립 배포본은 게시 폴더 최상위의 `DiskAtlas.exe` 실행 도우미를 사용합니다. `app/DiskAtlas.exe`는 실제 관리자 앱이므로 직접 열면 매번 UAC가 표시될 수 있습니다. i-luncher 로 설치한 앱은 이 도우미나 예약 작업을 쓰지 않습니다.
 
 설치 위치는 `%ProgramFiles%\i-luncher\DiskAtlas\<계정 SID>\`이며, 작업 스케줄러에는 `\i-luncher\DiskAtlas-<계정 SID>`가 등록됩니다. 설치된 파일은 일반 사용자에게 읽기·실행만 허용하고, 작업은 이 보호된 앱만 실행합니다. 게시 파일의 SHA-256 목록을 검증한 뒤 설치하며, 새 버전은 별도 폴더에 둡니다. 관리자 그룹에 속한 현재 계정의 승격을 사용합니다.
 
