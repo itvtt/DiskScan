@@ -137,6 +137,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (generation != _scanGeneration || token.IsCancellationRequested) return;
             acceptingProgress = false;
             ApplyScan(result, prepared, useAllocated);
+            ILuncher.AppKit.AppUsage.Count("scan", result.Summary.Files);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -220,6 +221,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (generation != _searchGeneration || token.IsCancellationRequested || !ReferenceEquals(scan, CurrentScan)) return;
             SearchResults = rows;
             acceptingProgress = false;
+            ILuncher.AppKit.AppUsage.Count("search");
             var limit = report.LimitReached ? " · 표시 한도 10,000개 도달" : "";
             SearchStatusText.Text = $"결과 {report.Hits.Count:N0}개 · 확인 {report.Examined:N0}개 · 시스템 제외 {report.Excluded:N0}개 · {Format.Duration(report.Elapsed)}{limit}";
         }
@@ -545,6 +547,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (generation != _duplicateGeneration) return;
             acceptingProgress = false;
             refreshScan = result.DeletedPaths.Count > 0;
+            if (refreshScan)
+            {
+                var deleted = new HashSet<string>(result.DeletedPaths, StringComparer.OrdinalIgnoreCase);
+                ILuncher.AppKit.AppUsage.Count("clean", DuplicateRows.Where(row => deleted.Contains(row.FullPath)).Sum(row => (double)row.Size));
+            }
             SetDuplicateFailures(result.Failures);
             if (!refreshScan) foreach (var row in DuplicateRows) row.Error = result.Failures.TryGetValue(row.FullPath, out var error) ? error : "";
             outcome = DeleteOutcome(result.DeletedPaths.Count, result.Failures, token.IsCancellationRequested);

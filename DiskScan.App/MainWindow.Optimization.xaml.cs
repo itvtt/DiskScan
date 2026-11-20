@@ -190,6 +190,7 @@ public partial class MainWindow
             _optimizationAcceptingProgress = false;
             if (preview) _optimizationPreview = report.IsPreview && !report.IsCanceled ? report : null;
             else _optimizationPreview = null;
+            if (!preview && report.DeletedCount > 0) ILuncher.AppKit.AppUsage.Count("clean", report.DeletedBytes);
             ApplyOptimizationReport(report, preview);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
