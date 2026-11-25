@@ -72,7 +72,7 @@ DiskScan/
 └─ dist/win-x64/          # DiskScan.exe 실행 도우미 + app/ 실제 앱
 ```
 
-`parapara`, `Compare`, `FastCopy`, 런처에 대한 소스·DLL·프로젝트 참조가 없습니다. 자체 솔루션에서 따로 개발할 수 있습니다. `parapara/diskcheck`는 시스템 검색 제외 정책과 기존 사용 흐름의 참고 자료로만 사용했습니다.
+`PARA`, `Compare`, `FastCopy`, 런처에 대한 소스·DLL·프로젝트 참조가 없습니다. 자체 솔루션에서 따로 개발할 수 있습니다. `PARA/diskcheck`는 시스템 검색 제외 정책과 기존 사용 흐름의 참고 자료로만 사용했습니다.
 
 ## 빌드
 
