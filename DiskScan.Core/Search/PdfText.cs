@@ -481,12 +481,19 @@ internal static class PdfText
 
     // ───────────────────────── fonts ─────────────────────────
 
+    private readonly record struct Glyph(uint Code, int Length, string Text);
+
     private sealed class FontDecoder
     {
         private Dictionary<ulong, string>? _map;
-        private List<(int Length, uint Low, uint High)> _codespace = [];
+        private readonly List<(int Length, uint Low, uint High)> _codespace = [];
         private bool _twoByte;
         private Encoding? _encoding;
+        private bool _identity;
+        private Dictionary<uint, double>? _cidWidths;
+        private double _defaultWidth = 500;
+        private double[]? _simpleWidths;
+        private int _firstChar;
 
         public static FontDecoder Create(PdfDocument document, PdfDictionary font)
         {
@@ -494,60 +501,151 @@ internal static class PdfText
             if (document.Resolve(font.GetValueOrDefault("ToUnicode")) is PdfDictionary toUnicode &&
                 document.StreamData(toUnicode) is { } cmap)
                 decoder.ParseCMap(cmap);
-
-            if (decoder._map is null || decoder._map.Count == 0)
-            {
+            if (decoder._map is { Count: 0 })
                 decoder._map = null;
-                string? encoding = document.Resolve(font.GetValueOrDefault("Encoding")) is PdfName name ? name.Value : null;
-                if (encoding is not null && decoder._twoByte)
-                {
-                    if (encoding.Contains("UCS2", StringComparison.Ordinal) || encoding.Contains("UTF16", StringComparison.Ordinal))
-                        decoder._encoding = Encoding.BigEndianUnicode;
-                    else if (encoding.StartsWith("KSC", StringComparison.Ordinal))
-                        decoder._encoding = Encoding.GetEncoding(949);
-                }
+
+            string? encoding = document.Resolve(font.GetValueOrDefault("Encoding")) is PdfName name ? name.Value : null;
+            decoder._identity = encoding is null or "Identity-H" or "Identity-V";
+            if (decoder._map is null && encoding is not null && decoder._twoByte)
+            {
+                if (encoding.Contains("UCS2", StringComparison.Ordinal) || encoding.Contains("UTF16", StringComparison.Ordinal))
+                    decoder._encoding = Encoding.BigEndianUnicode;
+                else if (encoding.StartsWith("KSC", StringComparison.Ordinal))
+                    decoder._encoding = Encoding.GetEncoding(949);
             }
+            decoder.ReadWidths(document, font);
             return decoder;
         }
 
-        public string Decode(byte[] bytes)
+        private void ReadWidths(PdfDocument document, PdfDictionary font)
         {
-            if (bytes.Length == 0)
-                return string.Empty;
-            if (_map is null)
+            if (_twoByte)
             {
-                if (_encoding is not null)
-                    return _encoding.GetString(bytes);
-                return _twoByte ? string.Empty : Encoding.Latin1.GetString(bytes);
+                _defaultWidth = 1000;
+                if (document.Resolve(font.GetValueOrDefault("DescendantFonts")) is not List<object?> { Count: > 0 } descendants ||
+                    document.Resolve(descendants[0]) is not PdfDictionary cid)
+                    return;
+                if (document.Resolve(cid.GetValueOrDefault("DW")) is double dw)
+                    _defaultWidth = dw;
+                if (document.Resolve(cid.GetValueOrDefault("W")) is not List<object?> widths)
+                    return;
+                _cidWidths = new Dictionary<uint, double>();
+                for (int index = 0; index < widths.Count;)
+                {
+                    if (document.Resolve(widths[index]) is not double first)
+                        break;
+                    object? next = index + 1 < widths.Count ? document.Resolve(widths[index + 1]) : null;
+                    if (next is List<object?> run)
+                    {
+                        for (int offset = 0; offset < run.Count && offset < 65536; offset++)
+                        {
+                            if (document.Resolve(run[offset]) is double width)
+                                _cidWidths[(uint)first + (uint)offset] = width;
+                        }
+                        index += 2;
+                    }
+                    else if (next is double last && index + 2 < widths.Count && document.Resolve(widths[index + 2]) is double width)
+                    {
+                        for (uint code = (uint)first; code <= (uint)last && code - (uint)first < 65536; code++)
+                            _cidWidths[code] = width;
+                        index += 3;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                return;
             }
 
-            var text = new StringBuilder(bytes.Length);
+            if (document.Resolve(font.GetValueOrDefault("Widths")) is List<object?> simple)
+            {
+                _firstChar = document.Resolve(font.GetValueOrDefault("FirstChar")) is double firstChar ? (int)firstChar : 0;
+                _simpleWidths = simple.Select(item => document.Resolve(item) is double width ? width : 0).ToArray();
+                _defaultWidth = 0;
+                if (document.Resolve(font.GetValueOrDefault("FontDescriptor")) is PdfDictionary descriptor &&
+                    document.Resolve(descriptor.GetValueOrDefault("MissingWidth")) is double missing)
+                    _defaultWidth = missing;
+            }
+            else
+            {
+                string baseFont = document.Resolve(font.GetValueOrDefault("BaseFont")) is PdfName baseName ? baseName.Value : "";
+                _defaultWidth = baseFont.Contains("Courier", StringComparison.OrdinalIgnoreCase) ? 600 : 500;
+            }
+        }
+
+        /// <summary>Advance width of a code in thousandths of the font size.</summary>
+        public double Width(Glyph glyph)
+        {
+            if (_twoByte)
+            {
+                if (_identity && _cidWidths is not null && _cidWidths.TryGetValue(glyph.Code, out double width))
+                    return width;
+                return glyph.Length == 1 || glyph.Code < 0x80 ? Math.Min(_defaultWidth, 500) : _defaultWidth;
+            }
+            if (_simpleWidths is not null)
+            {
+                int index = (int)glyph.Code - _firstChar;
+                if (index >= 0 && index < _simpleWidths.Length && _simpleWidths[index] > 0)
+                    return _simpleWidths[index];
+            }
+            return _defaultWidth;
+        }
+
+        public List<Glyph> Split(byte[] bytes)
+        {
+            var glyphs = new List<Glyph>(bytes.Length);
             int position = 0;
             while (position < bytes.Length)
             {
-                bool consumed = false;
-                for (int length = 1; length <= 4 && position + length <= bytes.Length; length++)
+                if (_map is not null)
                 {
-                    uint code = 0;
-                    for (int index = 0; index < length; index++)
-                        code = code << 8 | bytes[position + index];
-                    bool inCodespace = _codespace.Count == 0
-                        ? length == (_twoByte ? 2 : 1)
-                        : _codespace.Any(range => range.Length == length && code >= range.Low && code <= range.High);
-                    if (!inCodespace)
-                        continue;
-                    if (_map.TryGetValue(Key(length, code), out string? mapped))
-                        text.Append(mapped);
-                    else if (length == 1 && code >= 32)
-                        text.Append((char)code);
-                    position += length;
-                    consumed = true;
-                    break;
+                    bool consumed = false;
+                    for (int length = 1; length <= 4 && position + length <= bytes.Length; length++)
+                    {
+                        uint code = 0;
+                        for (int index = 0; index < length; index++)
+                            code = code << 8 | bytes[position + index];
+                        bool inCodespace = _codespace.Count == 0
+                            ? length == (_twoByte ? 2 : 1)
+                            : _codespace.Any(range => range.Length == length && code >= range.Low && code <= range.High);
+                        if (!inCodespace)
+                            continue;
+                        string text = _map.TryGetValue(Key(length, code), out string? mapped)
+                            ? mapped
+                            : length == 1 && code >= 32 ? ((char)code).ToString() : string.Empty;
+                        glyphs.Add(new Glyph(code, length, text));
+                        position += length;
+                        consumed = true;
+                        break;
+                    }
+                    if (!consumed)
+                    {
+                        int skip = Math.Min(_twoByte ? 2 : 1, bytes.Length - position);
+                        glyphs.Add(new Glyph(bytes[position], skip, string.Empty));
+                        position += skip;
+                    }
                 }
-                if (!consumed)
-                    position += _twoByte ? 2 : 1;
+                else if (_twoByte && _encoding is { CodePage: 949 } && bytes[position] < 0x81)
+                {
+                    glyphs.Add(new Glyph(bytes[position], 1, ((char)bytes[position]).ToString()));
+                    position++;
+                }
+                else if (_twoByte)
+                {
+                    int length = Math.Min(2, bytes.Length - position);
+                    uint code = length == 2 ? (uint)(bytes[position] << 8 | bytes[position + 1]) : bytes[position];
+                    string text = _encoding is null || length < 2 ? string.Empty : _encoding.GetString(bytes, position, 2);
+                    glyphs.Add(new Glyph(code, length, text));
+                    position += length;
+                }
+                else
+                {
+                    byte value = bytes[position++];
+                    glyphs.Add(new Glyph(value, 1, ((char)value).ToString()));
+                }
             }
-            return text.ToString();
+            return glyphs;
         }
 
         private static ulong Key(int length, uint code) => (ulong)length << 32 | code;
@@ -631,14 +729,31 @@ internal static class PdfText
 
     // ───────────────────────── page contents ─────────────────────────
 
+    /// <summary>
+    /// Follows the graphics and text state so that a space is written only where the
+    /// next piece of text really starts apart from the previous one (or on a new line).
+    /// PDF writers often draw one word, or even one glyph, per text object.
+    /// </summary>
     private sealed class ContentInterpreter(PdfDocument document, TextOutput output, CancellationToken cancellationToken)
     {
+        private static readonly double[] Identity = [1, 0, 0, 1, 0, 0];
+        private double[] _ctm = Identity;
+        private readonly Stack<double[]> _saved = new();
+        private double[] _textMatrix = Identity;
+        private double[] _lineMatrix = Identity;
+        private FontDecoder? _font;
+        private double _fontSize = 1;
+        private double _charSpacing;
+        private double _wordSpacing;
+        private double _horizontalScale = 1;
+        private double _leading;
+        private bool _hasLast;
+        private double _lastX, _lastY, _lastSize;
+
         public void Run(byte[] content, PdfDictionary? resources, int depth)
         {
             var lexer = new PdfLexer(content, 0, content.Length);
             var operands = new List<object?>();
-            FontDecoder? font = null;
-            double? lastLineY = null;
             int tokens = 0;
             while (true)
             {
@@ -655,21 +770,72 @@ internal static class PdfText
                     continue;
                 }
 
+                double Number(int fromEnd) => operands.Count >= fromEnd && operands[^fromEnd] is double value ? value : 0;
                 switch (op.Value)
                 {
+                    case "q":
+                        if (_saved.Count < 256)
+                            _saved.Push(_ctm);
+                        break;
+                    case "Q":
+                        if (_saved.Count > 0)
+                            _ctm = _saved.Pop();
+                        break;
+                    case "cm":
+                        if (operands.Count >= 6)
+                            _ctm = Multiply([Number(6), Number(5), Number(4), Number(3), Number(2), Number(1)], _ctm);
+                        break;
+                    case "BT":
+                        _textMatrix = _lineMatrix = Identity;
+                        break;
                     case "Tf":
-                        if (operands.Count >= 1 && operands[0] is PdfName fontName)
-                            font = document.Font(resources, fontName.Value);
+                        if (operands.Count >= 2 && operands[^2] is PdfName fontName)
+                        {
+                            _font = document.Font(resources, fontName.Value);
+                            _fontSize = Number(1);
+                        }
+                        break;
+                    case "Tc":
+                        _charSpacing = Number(1);
+                        break;
+                    case "Tw":
+                        _wordSpacing = Number(1);
+                        break;
+                    case "Tz":
+                        _horizontalScale = Number(1) / 100;
+                        break;
+                    case "TL":
+                        _leading = Number(1);
+                        break;
+                    case "Td":
+                        MoveLine(Number(2), Number(1));
+                        break;
+                    case "TD":
+                        _leading = -Number(1);
+                        MoveLine(Number(2), Number(1));
+                        break;
+                    case "Tm":
+                        if (operands.Count >= 6)
+                            _textMatrix = _lineMatrix = [Number(6), Number(5), Number(4), Number(3), Number(2), Number(1)];
+                        break;
+                    case "T*":
+                        MoveLine(0, -_leading);
                         break;
                     case "Tj":
                         if (operands.Count >= 1 && operands[^1] is PdfString shown)
-                            output.Append(Decode(font, shown));
+                            Show(shown);
                         break;
                     case "'":
-                    case "\"":
-                        output.Space();
+                        MoveLine(0, -_leading);
                         if (operands.Count >= 1 && operands[^1] is PdfString quoted)
-                            output.Append(Decode(font, quoted));
+                            Show(quoted);
+                        break;
+                    case "\"":
+                        _wordSpacing = Number(3);
+                        _charSpacing = Number(2);
+                        MoveLine(0, -_leading);
+                        if (operands.Count >= 1 && operands[^1] is PdfString spaced)
+                            Show(spaced);
                         break;
                     case "TJ":
                         if (operands.Count >= 1 && operands[^1] is List<object?> items)
@@ -677,27 +843,10 @@ internal static class PdfText
                             foreach (object? item in items)
                             {
                                 if (item is PdfString part)
-                                    output.Append(Decode(font, part));
-                                else if (item is double adjustment && adjustment < -180)
-                                    output.Space();
+                                    Show(part);
+                                else if (item is double adjustment)
+                                    Advance(-adjustment / 1000 * _fontSize * _horizontalScale);
                             }
-                        }
-                        break;
-                    case "Td":
-                    case "TD":
-                        if (operands.Count >= 2 && operands[^1] is double moveY && Math.Abs(moveY) > 0.01)
-                            output.Space();
-                        break;
-                    case "T*":
-                    case "ET":
-                        output.Space();
-                        break;
-                    case "Tm":
-                        if (operands.Count >= 6 && operands[^1] is double lineY)
-                        {
-                            if (lastLineY is not { } previous || Math.Abs(previous - lineY) > 0.01)
-                                output.Space();
-                            lastLineY = lineY;
                         }
                         break;
                     case "Do":
@@ -706,8 +855,12 @@ internal static class PdfText
                             document.StreamData(form) is { } formContent)
                         {
                             PdfDictionary? formResources = document.Resolve(form.GetValueOrDefault("Resources")) as PdfDictionary ?? resources;
+                            double[] savedCtm = _ctm, savedText = _textMatrix, savedLine = _lineMatrix;
+                            if (document.Resolve(form.GetValueOrDefault("Matrix")) is List<object?> { Count: 6 } matrix &&
+                                matrix.All(item => item is double))
+                                _ctm = Multiply(matrix.Select(item => (double)item!).ToArray(), _ctm);
                             Run(formContent, formResources, depth + 1);
-                            output.Space();
+                            (_ctm, _textMatrix, _lineMatrix) = (savedCtm, savedText, savedLine);
                         }
                         break;
                     case "BI":
@@ -720,14 +873,74 @@ internal static class PdfText
             }
         }
 
-        private static string Decode(FontDecoder? font, PdfString value) =>
-            font is null ? Encoding.Latin1.GetString(value.Bytes) : font.Decode(value.Bytes);
+        private void MoveLine(double tx, double ty)
+        {
+            _lineMatrix = Multiply([1, 0, 0, 1, tx, ty], _lineMatrix);
+            _textMatrix = _lineMatrix;
+        }
+
+        private void Advance(double tx)
+        {
+            double[] matrix = (double[])_textMatrix.Clone();
+            matrix[4] += tx * matrix[0];
+            matrix[5] += tx * matrix[1];
+            _textMatrix = matrix;
+        }
+
+        private void Show(PdfString value)
+        {
+            double[] start = Multiply(_textMatrix, _ctm);
+            double size = Math.Abs(_fontSize) * Math.Sqrt(start[2] * start[2] + start[3] * start[3]);
+            if (size < 1e-6)
+                size = Math.Abs(_fontSize) * Math.Sqrt(start[0] * start[0] + start[1] * start[1]);
+
+            if (_hasLast)
+            {
+                double length = Math.Sqrt(start[0] * start[0] + start[1] * start[1]);
+                double dirX = length > 1e-9 ? start[0] / length : 1, dirY = length > 1e-9 ? start[1] / length : 0;
+                double dx = start[4] - _lastX, dy = start[5] - _lastY;
+                double along = dx * dirX + dy * dirY;
+                double across = -dx * dirY + dy * dirX;
+                double scale = Math.Max(Math.Max(size, _lastSize), 1e-6);
+                if (Math.Abs(across) > scale * 0.5 || along > scale * 0.15 || along < -scale * 0.5)
+                    output.Space();
+            }
+
+            if (_font is null)
+            {
+                output.Append(Encoding.Latin1.GetString(value.Bytes));
+                Advance(value.Bytes.Length * (0.5 * _fontSize + _charSpacing) * _horizontalScale);
+            }
+            else
+            {
+                foreach (Glyph glyph in _font.Split(value.Bytes))
+                {
+                    output.Append(glyph.Text);
+                    double spacing = _charSpacing + (glyph.Length == 1 && glyph.Code == 32 ? _wordSpacing : 0);
+                    Advance((_font.Width(glyph) / 1000 * _fontSize + spacing) * _horizontalScale);
+                }
+            }
+
+            double[] end = Multiply(_textMatrix, _ctm);
+            (_hasLast, _lastX, _lastY, _lastSize) = (true, end[4], end[5], size);
+        }
+
+        private static double[] Multiply(double[] m, double[] n) =>
+        [
+            m[0] * n[0] + m[1] * n[2],
+            m[0] * n[1] + m[1] * n[3],
+            m[2] * n[0] + m[3] * n[2],
+            m[2] * n[1] + m[3] * n[3],
+            m[4] * n[0] + m[5] * n[2] + n[4],
+            m[4] * n[1] + m[5] * n[3] + n[5]
+        ];
     }
 
     private sealed class TextOutput(ContentMatcher matcher)
     {
         private readonly StringBuilder _text = new(16 * 1024);
         private bool _decided;
+        private bool _lastWasSpace = true;
 
         public bool IsDecided => _decided;
 
@@ -736,16 +949,25 @@ internal static class PdfText
             if (_decided || value.Length == 0)
                 return;
             foreach (char character in value)
-                _text.Append(character < 32 ? ' ' : character);
+            {
+                // Runs of spaces, tabs and control codes become one space.
+                if (character <= ' ' || char.IsWhiteSpace(character))
+                {
+                    if (!_lastWasSpace)
+                        _text.Append(' ');
+                    _lastWasSpace = true;
+                }
+                else
+                {
+                    _text.Append(character);
+                    _lastWasSpace = false;
+                }
+            }
             if (_text.Length >= 16 * 1024)
                 Flush();
         }
 
-        public void Space()
-        {
-            if (!_decided && _text.Length > 0 && _text[^1] != ' ')
-                _text.Append(' ');
-        }
+        public void Space() => Append(" ");
 
         public bool Boundary()
         {

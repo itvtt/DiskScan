@@ -518,6 +518,10 @@ await Check("PDF text: simple fonts, Flate streams with ToUnicode CID fonts, enc
     Assert(korean.Hits.Count == 1, "Identity-H PDF text was not mapped through ToUnicode");
     var spaced = await search.SearchAsync([FileNode(cid)], new SearchOptions("\"보고서 요약\"", SearchMode.Contents));
     Assert(spaced.Hits.Count == 1, "TJ word spacing was not turned into a space");
+    var pieces = Path.Combine(fixture, "pdf", "pieces.pdf");
+    File.WriteAllBytes(pieces, PdfFixtures.SeparateTextObjects());
+    var glued = await search.SearchAsync([FileNode(pieces)], new SearchOptions("\"2023년 12월호 next line\"", SearchMode.Contents));
+    Assert(glued.Hits.Count == 1, "Text drawn as separate touching objects must read as one word, gaps and new lines as one space");
 });
 
 await Check("name hits stream first and content hits follow in NameOrContents mode", async () =>
@@ -1048,6 +1052,23 @@ internal static class PdfFixtures
         Text("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
         Stream("", Text($"BT /F1 12 Tf 72 712 Td ({text}) Tj ET"))
     ], encrypted ? "<< /Root 1 0 R /Encrypt << /Filter /Standard /V 1 >> >>" : "<< /Root 1 0 R >>");
+
+    // "2023" and "년" drawn as separate text objects that touch (Helvetica: 0.5 em per
+    // character by default), then a real gap, then a new line.
+    internal static byte[] SeparateTextObjects() => Assemble(
+    [
+        Text("<< /Type /Catalog /Pages 2 0 R >>"),
+        Text("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        Text("<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>"),
+        Text("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        Text("<< /Type /Font /Subtype /Type0 /BaseFont /Gothic /Encoding /Identity-H /ToUnicode 7 0 R /DescendantFonts [8 0 R] >>"),
+        Stream("", Text("q 1 0 0 1 0 0 cm BT /F1 10 Tf 1 0 0 1 100 700 Tm (2023) Tj ET Q " +
+                        "q 1 0 0 1 0 0 cm BT /F2 10 Tf 1 0 0 1 120 700.2 Tm <0001> Tj ET Q " +
+                        "BT /F1 10 Tf 1 0 0 1 135 700 Tm (12) Tj ET BT /F2 10 Tf 145 700 Td <0002> Tj ET " +
+                        "BT /F1 10 Tf 72 680 Td (next) Tj 2 0 Td ( line) Tj ET")),
+        Stream("", Text("1 begincodespacerange <0000> <FFFF> endcodespacerange 2 beginbfchar <0001> <B144> <0002> <C6D4D638> endbfchar")),
+        Text("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Gothic /DW 1000 >>")
+    ], "<< /Root 1 0 R >>");
 
     internal static byte[] IdentityWithToUnicode()
     {
