@@ -17,6 +17,11 @@ public static class SearchPolicy
         FileAttributes.Offline |
         CloudOrRecallAttributes;
 
+    private const FileAttributes UnreadableAttributes =
+        FileAttributes.ReparsePoint |
+        FileAttributes.Offline |
+        CloudOrRecallAttributes;
+
     private static readonly HashSet<string> ProtectedRootDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "$Recycle.Bin", "System Volume Information", "Recovery", "$WinREAgent",
@@ -31,8 +36,28 @@ public static class SearchPolicy
         "bootmgr", "BOOTNXT", "ntldr", "ntdetect.com", "bootstat.dat"
     };
 
+    // Volume-root entries that are never useful in a name search (recycle bin
+    // internals, restore points, setup leftovers). NTFS metadata files start with $.
+    private static readonly HashSet<string> HiddenRootNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "$Recycle.Bin", "System Volume Information", "$WinREAgent", "Config.Msi",
+        "$WINDOWS.~BT", "$Windows.~WS", "Recovery", "Documents and Settings"
+    };
+
+    // Folders whose contents are usually build output, caches or tool data. They
+    // stay searchable but are ranked after the user's own files.
+    private static readonly HashSet<string> NoisyDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bin", "obj", "node_modules", ".git", ".svn", ".hg", ".vs", ".idea", "__pycache__",
+        "packages", ".nuget", ".cache", "AppData", "Temp", "tmp", "$Recycle.Bin"
+    };
+
     private static readonly string[] KnownOperatingSystemRoots = GetKnownOperatingSystemRoots();
 
+    /// <summary>
+    /// True when the item's contents must not be read: system files, protected
+    /// operating-system folders, links and cloud/offline placeholders (or anything below them).
+    /// </summary>
     public static bool IsExcluded(ScanNode node)
     {
         ArgumentNullException.ThrowIfNull(node);
@@ -48,11 +73,163 @@ public static class SearchPolicy
         ScanNode? current = node;
         for (int depth = 0; current is not null && depth < maximumParentDepth; depth++, current = current.Parent)
         {
-            if ((current.Attributes & ExcludedAttributes) != 0)
+            // Windows marks every volume root System/Hidden; that describes the
+            // mount itself, not the files stored on the volume.
+            if (!IsVolumeRoot(current) && (current.Attributes & ExcludedAttributes) != 0)
                 return true;
         }
 
         return current is not null;
+    }
+
+    /// <summary>
+    /// True when the item is left out of name search: system-attribute items (or
+    /// anything below one) and recycle-bin/restore-point internals at a volume root.
+    /// Operating-system folders such as Program Files stay findable by name.
+    /// </summary>
+    public static bool IsHiddenFromNameSearch(ScanNode node)
+    {
+        ArgumentNullException.ThrowIfNull(node);
+        return (new EligibilityCache().Get(node) & Eligibility.HiddenFromNames) != 0;
+    }
+
+    /// <summary>True for Windows, Program Files, ProgramData and similar volume-root system folders.</summary>
+    public static bool IsOperatingSystemPath(string? path) => IsProtectedPath(path);
+
+    [Flags]
+    internal enum Eligibility : byte
+    {
+        None = 0,
+        HiddenFromNames = 1,
+        ContentExcluded = 2,
+        OperatingSystem = 4,
+        Noisy = 8
+    }
+
+    /// <summary>
+    /// Computes eligibility for many nodes of one tree, evaluating each directory
+    /// once. Not thread-safe; fill it on one thread and read the results anywhere.
+    /// </summary>
+    internal sealed class EligibilityCache
+    {
+        private const int MaximumDepth = 4096;
+        private readonly Dictionary<ScanNode, Eligibility> _directories = new(ReferenceEqualityComparer.Instance);
+
+        public Eligibility Get(ScanNode node) => Get(node, 0);
+
+        private Eligibility Get(ScanNode node, int depth)
+        {
+            if (node.IsDirectory && _directories.TryGetValue(node, out Eligibility cached))
+                return cached;
+
+            Eligibility result;
+            if (depth > MaximumDepth)
+            {
+                // A corrupt parent cycle fails closed.
+                result = Eligibility.HiddenFromNames | Eligibility.ContentExcluded;
+            }
+            else if (node.Parent is null)
+            {
+                result = FromFullPath(node);
+            }
+            else
+            {
+                Eligibility parent = Get(node.Parent, depth + 1);
+                result = parent | FromAttributes(node);
+                if (IsVolumeRoot(node.Parent))
+                    result |= FromRootLevelName(node);
+                else if (node.IsDirectory && IsKnownOperatingSystemRoot(node.FullPath))
+                    result |= Eligibility.ContentExcluded | Eligibility.OperatingSystem;
+                if (node.IsDirectory && NoisyDirectoryNames.Contains(node.Name))
+                    result |= Eligibility.Noisy;
+            }
+
+            if (node.IsDirectory)
+                _directories[node] = result;
+            return result;
+        }
+
+        private static Eligibility FromAttributes(ScanNode node)
+        {
+            if (IsVolumeRoot(node))
+                return Eligibility.None;
+            Eligibility result = Eligibility.None;
+            if ((node.Attributes & FileAttributes.System) != 0)
+                result |= Eligibility.HiddenFromNames | Eligibility.ContentExcluded;
+            if ((node.Attributes & UnreadableAttributes) != 0)
+                result |= Eligibility.ContentExcluded;
+            return result;
+        }
+
+        private static Eligibility FromRootLevelName(ScanNode node)
+        {
+            Eligibility result = Eligibility.None;
+            string name = node.Name;
+            if (node.IsDirectory ? ProtectedRootDirectoryNames.Contains(name) : ProtectedRootFileNames.Contains(name))
+                result |= Eligibility.ContentExcluded | Eligibility.OperatingSystem;
+            if (HiddenRootNames.Contains(name) || name.StartsWith('$'))
+                result |= Eligibility.HiddenFromNames | Eligibility.ContentExcluded;
+            return result;
+        }
+
+        private static Eligibility FromFullPath(ScanNode node)
+        {
+            Eligibility result = FromAttributes(node);
+            string path = node.FullPath;
+            if (IsProtectedPath(path))
+                result |= Eligibility.ContentExcluded | Eligibility.OperatingSystem;
+
+            string root;
+            try { root = Path.GetPathRoot(path) ?? string.Empty; }
+            catch { root = string.Empty; }
+            if (root.Length == 0 || path.Length <= root.Length)
+                return result;
+
+            string[] segments = path[root.Length..].Split(
+                [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length > 0 && (HiddenRootNames.Contains(segments[0]) || segments[0].StartsWith('$')))
+                result |= Eligibility.HiddenFromNames | Eligibility.ContentExcluded;
+            int directorySegments = node.IsDirectory ? segments.Length : segments.Length - 1;
+            for (int index = 0; index < directorySegments; index++)
+            {
+                if (NoisyDirectoryNames.Contains(segments[index]))
+                {
+                    result |= Eligibility.Noisy;
+                    break;
+                }
+            }
+            return result;
+        }
+    }
+
+    private static bool IsVolumeRoot(ScanNode node)
+    {
+        string path = node.FullPath;
+        if (string.IsNullOrEmpty(path))
+            return false;
+        // Fast path: drive roots are "C:\" or "C:"; only UNC paths need the full check.
+        if (path.Length > 3 && !path.StartsWith(@"\\", StringComparison.Ordinal))
+            return false;
+        try
+        {
+            string? root = Path.GetPathRoot(path);
+            return !string.IsNullOrEmpty(root) &&
+                   string.Equals(Path.TrimEndingDirectorySeparator(root), Path.TrimEndingDirectorySeparator(path), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsKnownOperatingSystemRoot(string path)
+    {
+        foreach (string root in KnownOperatingSystemRoots)
+        {
+            if (path.Length == root.Length && path.Equals(root, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     private static bool IsProtectedPath(string? path)

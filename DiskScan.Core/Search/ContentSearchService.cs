@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Text;
@@ -6,24 +7,36 @@ using System.Xml;
 
 namespace DiskScan.Core;
 
+/// <summary>
+/// File search over a scanned tree. Names (files and folders) are checked first in
+/// memory and returned at once, ranked by how well they match; file contents are
+/// then read in parallel and streamed as they match.
+/// </summary>
 public sealed class ContentSearchService
 {
     private const int ReadBufferCharacters = 32 * 1024;
     private const int ProbeBytes = 8 * 1024;
-    private const int WorkBatchSize = 128;
     public const long MaximumOfficeExpandedXmlBytes = 256L * 1024 * 1024;
     public const int MaximumOfficeArchiveEntries = 20_000;
 
-    public static IReadOnlyList<string> SupportedOfficeFileExtensions { get; } =
-        Array.AsReadOnly([".docx", ".xlsx", ".pptx"]);
+    static ContentSearchService()
+    {
+        try { Encoding.RegisterProvider(CodePagesEncodingProvider.Instance); }
+        catch { /* code pages unavailable: CP949 text is then skipped */ }
+    }
 
-    /// <summary>
-    /// PDF and legacy binary Office formats are not decoded. Files with other
-    /// extensions are searched when their initial bytes are plausible UTF-8 text.
-    /// </summary>
+    public static IReadOnlyList<string> SupportedOfficeFileExtensions { get; } = Array.AsReadOnly(
+    [
+        ".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx", ".xltm",
+        ".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm", ".hwpx", ".odt", ".ods", ".odp",
+        ".hwp", ".doc", ".dot", ".xls", ".xlt", ".ppt", ".pps", ".pot", ".pdf"
+    ]);
+
+    /// <summary>What content search can read.</summary>
     public static string CapabilitySummary =>
-        "Text/code/log files, plausible UTF-8 text with unknown extensions, and streaming .docx/.xlsx/.pptx XML are supported. " +
-        "BOM-marked UTF-8/UTF-16/UTF-32 are detected. PDF and legacy binary Office formats are not supported.";
+        "Text/code/log files (UTF-8, UTF-16/32, CP949), plausible text with unknown extensions, " +
+        "Office Open XML (.docx/.xlsx/.pptx and macro/template variants), HWPX, OpenDocument, HWP 5, " +
+        "legacy .doc/.xls/.ppt and PDF text. Scanned images (OCR), encrypted documents and archives are not read.";
 
     private static readonly HashSet<string> TextExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -41,18 +54,22 @@ public sealed class ContentSearchService
 
     private static readonly HashSet<string> KnownBinaryExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".exe", ".dll", ".sys", ".com", ".obj", ".pdb", ".bin", ".dat", ".db", ".sqlite", ".mdb",
-        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico", ".heic", ".raw",
-        ".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".mp4", ".mkv", ".avi", ".mov", ".wmv",
-        ".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".tar", ".iso", ".cab", ".msi", ".pdf",
-        ".doc", ".xls", ".ppt", ".rtf", ".woff", ".woff2", ".ttf", ".otf"
+        ".exe", ".dll", ".sys", ".com", ".obj", ".pdb", ".bin", ".dat", ".db", ".sqlite", ".mdb", ".accdb",
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico", ".heic", ".raw", ".avif", ".psd",
+        ".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".opus", ".mp4", ".mkv", ".avi", ".mov", ".wmv",
+        ".m4v", ".webm", ".mpg", ".mpeg", ".3gp", ".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".tar", ".tgz",
+        ".zst", ".lz4", ".iso", ".img", ".vhd", ".vhdx", ".vmdk", ".wim", ".esd", ".cab", ".msi", ".msix", ".appx",
+        ".apk", ".jar", ".war", ".class", ".pyc", ".pyd", ".whl", ".nupkg", ".snupkg", ".lib", ".a", ".so",
+        ".dylib", ".pack", ".idx", ".woff", ".woff2", ".ttf", ".otf", ".pst", ".ost", ".edb", ".dmp", ".etl",
+        ".evtx", ".pf", ".blf", ".regtrans-ms", ".ldf", ".mdf", ".ndf"
     };
 
     public async Task<SearchReport> SearchAsync(
         IEnumerable<ScanNode> files,
         SearchOptions options,
         IProgress<SearchProgress>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IProgress<IReadOnlyList<SearchHit>>? hitProgress = null)
     {
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(options);
@@ -60,407 +77,330 @@ public sealed class ContentSearchService
             throw new ArgumentOutOfRangeException(nameof(options), "MaxResults must be greater than zero.");
 
         cancellationToken.ThrowIfCancellationRequested();
-        QueryExpression expression = QueryExpression.Parse(options.Query);
+        var plan = new SearchPlan(QueryExpression.Parse(options.Query, options.Conditions), options);
         var stopwatch = Stopwatch.StartNew();
 
-        // Snapshot enumeration and all names before parallel work. Filename-only
-        // searching consequently performs no filesystem reads. Preparation is
-        // offloaded because callers commonly invoke this method on the UI thread.
-        Preparation preparation = await Task.Run(() => Prepare(files, cancellationToken), cancellationToken)
+        // Snapshot, eligibility and the name pass are CPU-only and run off the
+        // caller's thread (commonly the UI thread).
+        NamePass names = await Task.Run(() => RunNamePass(files, plan, cancellationToken), cancellationToken)
             .ConfigureAwait(false);
-        List<Candidate> eligible = preparation.Eligible;
-        long excluded = preparation.Excluded;
 
-        long examined = 0;
-        long skipped = 0;
-        long matchesObserved = 0;
+        var hits = new List<SearchHit>(Math.Min(options.MaxResults, 4096));
         bool limitReached = false;
-        var hits = new List<SearchHit>(Math.Min(Math.Min(options.MaxResults, eligible.Count), 4096));
-        progress?.Report(new SearchProgress(0, eligible.Count, 0, 0));
-        long nextProgressTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency / 10;
 
-        void ReportProgress(bool force = false)
+        void Emit(List<SearchHit> batch)
         {
-            if (progress is null)
+            if (batch.Count == 0)
                 return;
-
-            if (!force)
-            {
-                long now = Stopwatch.GetTimestamp();
-                long expected = Volatile.Read(ref nextProgressTimestamp);
-                if (now < expected || Interlocked.CompareExchange(
-                        ref nextProgressTimestamp,
-                        now + Stopwatch.Frequency / 10,
-                        expected) != expected)
-                    return;
-            }
-
-            progress.Report(new SearchProgress(
-                Interlocked.Read(ref examined),
-                eligible.Count,
-                Math.Min(Interlocked.Read(ref matchesObserved), options.MaxResults),
-                Interlocked.Read(ref skipped)));
+            hits.AddRange(batch);
+            hitProgress?.Report(batch.ToArray());
         }
 
-        int degree = Math.Max(1, Math.Min(Environment.ProcessorCount, 8));
-        for (int offset = 0; offset < eligible.Count && !limitReached; offset += WorkBatchSize)
+        var exact = names.Exact;
+        if (exact.Count > options.MaxResults)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            int count = Math.Min(WorkBatchSize, eligible.Count - offset);
-            var outcomes = new SearchOutcome[count];
+            exact = exact.GetRange(0, options.MaxResults);
+            limitReached = true;
+        }
+        Emit(exact.ConvertAll(item => item.Hit));
 
-            await Parallel.ForEachAsync(
-                Enumerable.Range(0, count),
-                new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = degree },
-                async (localIndex, token) =>
-                {
-                    Candidate candidate = eligible[offset + localIndex];
-                    SearchOutcome outcome = await SearchCandidateAsync(candidate, options, expression, token).ConfigureAwait(false);
-                    outcomes[localIndex] = outcome;
+        long examined = 0, skipped = 0;
+        int contentTotal = names.ContentCandidates.Count;
+        progress?.Report(new SearchProgress(0, contentTotal, hits.Count, 0));
 
-                    Interlocked.Increment(ref examined);
-                    if (outcome.Skipped)
-                        Interlocked.Increment(ref skipped);
-                    if (outcome.Hit is not null)
-                        Interlocked.Increment(ref matchesObserved);
-                    ReportProgress();
-                }).ConfigureAwait(false);
+        if (!limitReached && contentTotal > 0)
+        {
+            ScanNode[] candidates = OrderContentCandidates(names.ContentCandidates, names.Flags);
+            var found = new ConcurrentQueue<SearchHit>();
+            int accepted = hits.Count;
+            object flushLock = new();
+            long nextFlush = Stopwatch.GetTimestamp() + Stopwatch.Frequency / 8;
+            using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
-            // Commit each completed batch in the original snapshot order.
-            for (int i = 0; i < outcomes.Length; i++)
+            void Flush(bool force)
             {
-                SearchHit? hit = outcomes[i].Hit;
-                if (hit is null)
-                    continue;
-
-                if (hits.Count == options.MaxResults)
+                long now = Stopwatch.GetTimestamp();
+                if (!force && now < Volatile.Read(ref nextFlush))
+                    return;
+                if (!Monitor.TryEnter(flushLock))
                 {
-                    limitReached = true;
-                    break;
+                    if (!force)
+                        return;
+                    Monitor.Enter(flushLock);
                 }
-
-                hits.Add(hit);
-                if (hits.Count == options.MaxResults)
+                try
                 {
-                    limitReached = true;
-                    break;
+                    Volatile.Write(ref nextFlush, now + Stopwatch.Frequency / 8);
+                    var batch = new List<SearchHit>();
+                    while (found.TryDequeue(out SearchHit? hit))
+                        batch.Add(hit);
+                    Emit(batch);
+                    progress?.Report(new SearchProgress(Interlocked.Read(ref examined), contentTotal,
+                        hits.Count, Interlocked.Read(ref skipped)));
+                }
+                finally
+                {
+                    Monitor.Exit(flushLock);
                 }
             }
+
+            try
+            {
+                await Task.Run(() => Parallel.ForEach(
+                    candidates,
+                    new ParallelOptions
+                    {
+                        CancellationToken = limit.Token,
+                        MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount * 2, 4, 16)
+                    },
+                    node =>
+                    {
+                        ContentOutcome outcome = SearchContents(node, plan, limit.Token);
+                        Interlocked.Increment(ref examined);
+                        if (outcome.Skipped)
+                            Interlocked.Increment(ref skipped);
+                        if (outcome.Hit is not null)
+                        {
+                            if (Interlocked.Increment(ref accepted) <= options.MaxResults)
+                                found.Enqueue(outcome.Hit);
+                            else
+                            {
+                                limitReached = true;
+                                limit.Cancel();
+                            }
+                        }
+                        Flush(force: false);
+                    }), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && limitReached)
+            {
+                // The result limit stopped the remaining reads.
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Volatile.Read(ref accepted) >= options.MaxResults && examined < contentTotal)
+                limitReached = true;
+            Flush(force: true);
         }
 
         stopwatch.Stop();
-        ReportProgress(force: true);
-        return new SearchReport(hits, examined, excluded, skipped, limitReached, stopwatch.Elapsed);
+        progress?.Report(new SearchProgress(examined, contentTotal, hits.Count, skipped));
+        return new SearchReport(hits, names.Examined, names.Excluded, skipped, limitReached, stopwatch.Elapsed, examined);
     }
 
-    private static Preparation Prepare(IEnumerable<ScanNode> files, CancellationToken cancellationToken)
+    // ───────────────────────── name pass ─────────────────────────
+
+    private static NamePass RunNamePass(IEnumerable<ScanNode> files, SearchPlan plan, CancellationToken cancellationToken)
     {
-        var eligible = new List<Candidate>();
-        long excluded = 0;
+        var nodes = new List<ScanNode>();
         foreach (ScanNode node in files)
         {
             cancellationToken.ThrowIfCancellationRequested();
             ArgumentNullException.ThrowIfNull(node);
-            var candidate = new Candidate(node, node.Name ?? string.Empty);
-            if (SearchPolicy.IsExcluded(node))
-                excluded++;
-            else
-                eligible.Add(candidate);
+            nodes.Add(node);
         }
 
-        return new Preparation(eligible, excluded);
+        var flags = new SearchPolicy.Eligibility[nodes.Count];
+        var cache = new SearchPolicy.EligibilityCache();
+        for (int index = 0; index < nodes.Count; index++)
+        {
+            if ((index & 0xFFF) == 0)
+                cancellationToken.ThrowIfCancellationRequested();
+            flags[index] = cache.Get(nodes[index]);
+        }
+
+        var outcomes = new NameOutcome[nodes.Count];
+        Parallel.For(0, nodes.Count, new ParallelOptions { CancellationToken = cancellationToken }, index =>
+        {
+            outcomes[index] = (flags[index] & SearchPolicy.Eligibility.HiddenFromNames) != 0
+                ? new NameOutcome(NameResult.Excluded, 0, null)
+                : plan.CheckName(nodes[index], flags[index]);
+        });
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var exact = new List<RankedHit>();
+        var content = new List<ScanNode>();
+        var contentFlags = new Dictionary<ScanNode, SearchPolicy.Eligibility>(ReferenceEqualityComparer.Instance);
+        long excluded = 0;
+        for (int index = 0; index < nodes.Count; index++)
+        {
+            NameOutcome outcome = outcomes[index];
+            ScanNode node = nodes[index];
+            switch (outcome.Result)
+            {
+                case NameResult.Excluded:
+                    excluded++;
+                    break;
+                case NameResult.Hit:
+                    exact.Add(new RankedHit(outcome.Hit!, RankKey.Create(node, flags[index], outcome.Quality)));
+                    break;
+                case NameResult.NeedsContent:
+                    content.Add(node);
+                    contentFlags[node] = flags[index];
+                    break;
+            }
+        }
+
+        exact.Sort(static (left, right) => left.Key.CompareTo(right.Key));
+        return new NamePass(exact, content, contentFlags, nodes.Count - excluded, excluded);
     }
 
-    private static async ValueTask<SearchOutcome> SearchCandidateAsync(
-        Candidate candidate,
-        SearchOptions options,
-        QueryExpression expression,
-        CancellationToken cancellationToken)
+    private static ScanNode[] OrderContentCandidates(List<ScanNode> candidates, Dictionary<ScanNode, SearchPolicy.Eligibility> flags)
+    {
+        // The user's own files first; build output, caches and tool folders after.
+        const SearchPolicy.Eligibility later = SearchPolicy.Eligibility.Noisy | SearchPolicy.Eligibility.OperatingSystem;
+        var ordered = new List<ScanNode>(candidates.Count);
+        ordered.AddRange(candidates.Where(node => (flags.GetValueOrDefault(node) & later) == 0));
+        ordered.AddRange(candidates.Where(node => (flags.GetValueOrDefault(node) & later) != 0));
+        return ordered.ToArray();
+    }
+
+    // ───────────────────────── content pass ─────────────────────────
+
+    private static ContentOutcome SearchContents(ScanNode node, SearchPlan plan, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        ScanNode node = candidate.Node;
+        var matcher = plan.CreateContentMatcher(node);
+        ReadStatus status;
+        try
+        {
+            status = FormatOf(node) switch
+            {
+                ContentFormat.ZipXml => ReadZipXml(node, matcher, cancellationToken),
+                ContentFormat.Hwp => LegacyDocumentText.ReadHwp(node.FullPath, matcher, cancellationToken),
+                ContentFormat.LegacyOffice => LegacyDocumentText.ReadLegacyOffice(node.FullPath, node.Extension, matcher, cancellationToken),
+                ContentFormat.Pdf => PdfText.Read(node.FullPath, matcher, cancellationToken),
+                ContentFormat.Text => ReadText(node, matcher, cancellationToken),
+                _ => ReadStatus.NotSearchable
+            };
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or XmlException
+                                       or NotSupportedException or DecoderFallbackException or ArgumentException
+                                       or IndexOutOfRangeException or OverflowException or FormatException)
+        {
+            status = ReadStatus.NotSearchable;
+        }
+
+        bool skipped = status == ReadStatus.NotSearchable;
+        SearchHit? hit = plan.FinishContent(node, matcher, readable: !skipped);
+        return new ContentOutcome(hit, skipped);
+    }
+
+    internal enum ContentFormat { None, Text, ZipXml, Hwp, LegacyOffice, Pdf }
+
+    internal static ContentFormat FormatOf(ScanNode node)
+    {
         if (node.IsDirectory)
-            return SearchOutcome.NotSearchable;
-
-        StringComparison comparison = options.MatchCase
-            ? StringComparison.Ordinal
-            : StringComparison.OrdinalIgnoreCase;
-
-        if (options.Mode == SearchMode.FileName)
-        {
-            if (expression.MatchesText(candidate.Name, comparison))
-                return new SearchOutcome(new SearchHit(node, "Name", candidate.Name), false);
-            return SearchOutcome.NoMatch;
-        }
-
-        if (options.Mode == SearchMode.NameOrContents)
-        {
-            if (expression.MatchesText(candidate.Name, comparison))
-                return new SearchOutcome(new SearchHit(node, "Name", candidate.Name), false);
-        }
-
-        var matchState = new QueryMatchState(expression, comparison);
-        if (options.Mode == SearchMode.NameOrContents)
-            matchState.MatchWhole(candidate.Name);
-
+            return ContentFormat.None;
         string extension = node.Extension;
-        if (extension is ".docx" or ".xlsx" or ".pptx")
-            return await SearchOfficeAsync(node, matchState, cancellationToken).ConfigureAwait(false);
-
-        if (KnownBinaryExtensions.Contains(extension))
-            return SearchOutcome.NotSearchable;
-
-        return await SearchTextFileAsync(node, matchState, cancellationToken)
-            .ConfigureAwait(false);
-    }
-
-    private static async ValueTask<SearchOutcome> SearchTextFileAsync(
-        ScanNode node,
-        QueryMatchState matchState,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            await using var stream = new FileStream(
-                node.FullPath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete,
-                64 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
-
-            byte[] probe = ArrayPool<byte>.Shared.Rent(ProbeBytes);
-            int probeLength;
-            try
-            {
-                probeLength = await stream.ReadAsync(probe.AsMemory(0, ProbeBytes), cancellationToken).ConfigureAwait(false);
-                bool hasBom = HasUnicodeBom(probe.AsSpan(0, probeLength));
-                if (!hasBom && !LooksLikeUtf8Text(probe.AsSpan(0, probeLength)))
-                    return SearchOutcome.NotSearchable;
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(probe);
-            }
-
-            stream.Position = 0;
-            using var reader = new StreamReader(
-                stream,
-                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false),
-                detectEncodingFromByteOrderMarks: true,
-                bufferSize: 16 * 1024,
-                leaveOpen: false);
-
-            char[] buffer = ArrayPool<char>.Shared.Rent(ReadBufferCharacters);
-            try
-            {
-                while (true)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    int read = await reader.ReadAsync(buffer.AsMemory(0, ReadBufferCharacters), cancellationToken)
-                        .ConfigureAwait(false);
-                    if (read == 0)
-                        break;
-
-                    MatchDetails? match = matchState.Feed(buffer.AsSpan(0, read));
-                    if (match is not null)
-                        return new SearchOutcome(new SearchHit(node, "Contents", match.Preview, match.LineNumber), false);
-                }
-            }
-            finally
-            {
-                ArrayPool<char>.Shared.Return(buffer);
-            }
-
-            return SearchOutcome.NoMatch;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException or DecoderFallbackException)
-        {
-            return SearchOutcome.NotSearchable;
-        }
-    }
-
-    private static async ValueTask<SearchOutcome> SearchOfficeAsync(
-        ScanNode node,
-        QueryMatchState matchState,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            await using var stream = new FileStream(
-                node.FullPath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete,
-                64 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
-            using var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: false);
-
-            if (archive.Entries.Count > MaximumOfficeArchiveEntries)
-                return SearchOutcome.NotSearchable;
-
-            long expandedBytes = 0;
-            foreach (ZipArchiveEntry entry in archive.Entries)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!IsSearchableOfficeXml(entry.FullName, node.Extension))
-                    continue;
-
-                if (entry.Length < 0 || expandedBytes > MaximumOfficeExpandedXmlBytes - entry.Length)
-                    return SearchOutcome.NotSearchable;
-                expandedBytes += entry.Length;
-
-                await using Stream entryStream = entry.Open();
-                using XmlReader xml = XmlReader.Create(entryStream, new XmlReaderSettings
-                {
-                    Async = true,
-                    DtdProcessing = DtdProcessing.Prohibit,
-                    XmlResolver = null,
-                    IgnoreComments = true,
-                    IgnoreProcessingInstructions = true
-                });
-
-                if (!xml.CanReadValueChunk)
-                    return SearchOutcome.NotSearchable;
-
-                char[] valueBuffer = ArrayPool<char>.Shared.Rent(ReadBufferCharacters);
-                try
-                {
-                    while (await xml.ReadAsync().ConfigureAwait(false))
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        if ((xml.NodeType == XmlNodeType.EndElement &&
-                             IsOfficeTextBoundary(xml.LocalName, entry.FullName, node.Extension)) ||
-                            (xml.NodeType == XmlNodeType.Element &&
-                             IsOfficeExplicitBreak(xml.LocalName, node.Extension)))
-                        {
-                            MatchDetails? elementBoundaryMatch = matchState.Feed(" ".AsSpan());
-                            if (elementBoundaryMatch is not null)
-                                return new SearchOutcome(new SearchHit(node, "Contents", elementBoundaryMatch.Preview), false);
-                            continue;
-                        }
-
-                        if (xml.NodeType is not (XmlNodeType.Text or XmlNodeType.CDATA or XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace))
-                            continue;
-
-                        while (true)
-                        {
-                            cancellationToken.ThrowIfCancellationRequested();
-                            int read = await xml.ReadValueChunkAsync(valueBuffer, 0, ReadBufferCharacters)
-                                .ConfigureAwait(false);
-                            if (read == 0)
-                                break;
-
-                            MatchDetails? match = matchState.Feed(valueBuffer.AsSpan(0, read));
-                            if (match is not null)
-                                return new SearchOutcome(new SearchHit(node, "Contents", match.Preview), false);
-                        }
-                    }
-                }
-                finally
-                {
-                    ArrayPool<char>.Shared.Return(valueBuffer);
-                }
-
-                MatchDetails? boundaryMatch = matchState.Feed(" ".AsSpan());
-                if (boundaryMatch is not null)
-                    return new SearchOutcome(new SearchHit(node, "Contents", boundaryMatch.Preview), false);
-            }
-
-            return SearchOutcome.NoMatch;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or XmlException or NotSupportedException)
-        {
-            return SearchOutcome.NotSearchable;
-        }
-    }
-
-    private static bool IsSearchableOfficeXml(string entryName, string extension)
-    {
-        string normalized = entryName.Replace('\\', '/');
-        if (!normalized.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
-            return false;
-
+        if (ZipFamily(extension) is not null)
+            return ContentFormat.ZipXml;
         return extension switch
         {
-            ".docx" => normalized.Equals("word/document.xml", StringComparison.OrdinalIgnoreCase) ||
-                       normalized.StartsWith("word/header", StringComparison.OrdinalIgnoreCase) ||
-                       normalized.StartsWith("word/footer", StringComparison.OrdinalIgnoreCase) ||
-                       normalized.Equals("word/footnotes.xml", StringComparison.OrdinalIgnoreCase) ||
-                       normalized.Equals("word/endnotes.xml", StringComparison.OrdinalIgnoreCase) ||
-                       normalized.Equals("word/comments.xml", StringComparison.OrdinalIgnoreCase),
-            ".xlsx" => normalized.Equals("xl/sharedStrings.xml", StringComparison.OrdinalIgnoreCase) ||
-                       normalized.StartsWith("xl/worksheets/", StringComparison.OrdinalIgnoreCase),
-            ".pptx" => normalized.StartsWith("ppt/slides/slide", StringComparison.OrdinalIgnoreCase) ||
-                       normalized.StartsWith("ppt/notesSlides/notesSlide", StringComparison.OrdinalIgnoreCase),
-            _ => false
+            ".hwp" => ContentFormat.Hwp,
+            ".doc" or ".dot" or ".xls" or ".xlt" or ".ppt" or ".pps" or ".pot" => ContentFormat.LegacyOffice,
+            ".pdf" => ContentFormat.Pdf,
+            _ => KnownBinaryExtensions.Contains(extension) ? ContentFormat.None : ContentFormat.Text
         };
     }
 
-    private static bool IsOfficeTextBoundary(string localName, string entryName, string extension)
+    internal enum ReadStatus { NotSearchable, Completed, Decided }
+
+    private static ReadStatus ReadText(ScanNode node, ContentMatcher matcher, CancellationToken cancellationToken)
     {
-        if (extension is ".docx" or ".pptx")
-            return localName.Equals("p", StringComparison.OrdinalIgnoreCase);
+        using var stream = new FileStream(node.FullPath, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, 64 * 1024, FileOptions.SequentialScan);
 
-        if (extension != ".xlsx")
-            return false;
-
-        string normalized = entryName.Replace('\\', '/');
-        return normalized.Equals("xl/sharedStrings.xml", StringComparison.OrdinalIgnoreCase)
-            ? localName.Equals("si", StringComparison.OrdinalIgnoreCase)
-            : localName.Equals("c", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsOfficeExplicitBreak(string localName, string extension) => extension switch
-    {
-        ".docx" => localName.Equals("br", StringComparison.OrdinalIgnoreCase) ||
-                   localName.Equals("cr", StringComparison.OrdinalIgnoreCase) ||
-                   localName.Equals("tab", StringComparison.OrdinalIgnoreCase),
-        ".pptx" => localName.Equals("br", StringComparison.OrdinalIgnoreCase),
-        _ => false
-    };
-
-    private static bool HasUnicodeBom(ReadOnlySpan<byte> bytes)
-    {
-        return HasPrefix(bytes, 0xEF, 0xBB, 0xBF) ||
-               HasPrefix(bytes, 0xFF, 0xFE, 0x00, 0x00) ||
-               HasPrefix(bytes, 0x00, 0x00, 0xFE, 0xFF) ||
-               HasPrefix(bytes, 0xFF, 0xFE) ||
-               HasPrefix(bytes, 0xFE, 0xFF);
-    }
-
-    private static bool HasPrefix(ReadOnlySpan<byte> bytes, params byte[] prefix) =>
-        bytes.Length >= prefix.Length && bytes[..prefix.Length].SequenceEqual(prefix);
-
-    private static bool LooksLikeUtf8Text(ReadOnlySpan<byte> bytes)
-    {
-        if (bytes.IsEmpty)
-            return true;
-
-        int controls = 0;
-        foreach (byte value in bytes)
-        {
-            if (value == 0)
-                return false;
-            if (value < 0x20 && value is not (0x09 or 0x0A or 0x0C or 0x0D or 0x1B))
-                controls++;
-        }
-
-        if (controls * 100 > bytes.Length * 2)
-            return false;
-
+        Encoding? encoding;
+        byte[] probe = ArrayPool<byte>.Shared.Rent(ProbeBytes);
         try
         {
-            Decoder decoder = new UTF8Encoding(false, true).GetDecoder();
-            _ = decoder.GetCharCount(bytes, flush: false);
+            int probeLength = stream.ReadAtLeast(probe.AsSpan(0, ProbeBytes), ProbeBytes, throwOnEndOfStream: false);
+            encoding = DetectTextEncoding(probe.AsSpan(0, probeLength), probeLength < ProbeBytes);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(probe);
+        }
+        if (encoding is null)
+            return ReadStatus.NotSearchable;
+
+        stream.Position = 0;
+        using var reader = new StreamReader(stream, encoding, detectEncodingFromByteOrderMarks: true,
+            bufferSize: 16 * 1024, leaveOpen: false);
+        char[] buffer = ArrayPool<char>.Shared.Rent(ReadBufferCharacters);
+        try
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int read = reader.Read(buffer, 0, ReadBufferCharacters);
+                if (read == 0)
+                    return ReadStatus.Completed;
+                if (matcher.Feed(buffer.AsSpan(0, read)))
+                    return ReadStatus.Decided;
+            }
+        }
+        finally
+        {
+            ArrayPool<char>.Shared.Return(buffer);
+        }
+    }
+
+    internal static Encoding? DetectTextEncoding(ReadOnlySpan<byte> bytes, bool isWholeFile)
+    {
+        if (HasUnicodeBom(bytes) || bytes.IsEmpty)
+            return new UTF8Encoding(false, false);
+
+        int zeros = 0, evenZeros = 0, oddZeros = 0, controls = 0;
+        for (int index = 0; index < bytes.Length; index++)
+        {
+            byte value = bytes[index];
+            if (value == 0)
+            {
+                zeros++;
+                if ((index & 1) == 0) evenZeros++; else oddZeros++;
+            }
+            else if (value < 0x20 && value is not (0x09 or 0x0A or 0x0C or 0x0D or 0x1B))
+            {
+                controls++;
+            }
+        }
+
+        // UTF-16 without a byte order mark: mostly-ASCII text has a zero in every other byte.
+        int half = Math.Max(1, bytes.Length / 2);
+        if (bytes.Length >= 16 && oddZeros * 10 > half * 4 && evenZeros * 20 < half)
+            return new UnicodeEncoding(bigEndian: false, byteOrderMark: false, throwOnInvalidBytes: false);
+        if (bytes.Length >= 16 && evenZeros * 10 > half * 4 && oddZeros * 20 < half)
+            return new UnicodeEncoding(bigEndian: true, byteOrderMark: false, throwOnInvalidBytes: false);
+
+        if (zeros != 0 || controls * 100 > bytes.Length * 2)
+            return null;
+
+        if (Decodes(new UTF8Encoding(false, true), bytes, isWholeFile))
+            return new UTF8Encoding(false, false);
+
+        // Korean ANSI text (CP949 / EUC-KR) written by older Windows tools.
+        try
+        {
+            Encoding strict = Encoding.GetEncoding(949, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
+            if (Decodes(strict, bytes, isWholeFile))
+                return Encoding.GetEncoding(949);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+        }
+        return null;
+    }
+
+    private static bool Decodes(Encoding strict, ReadOnlySpan<byte> bytes, bool flush)
+    {
+        try
+        {
+            _ = strict.GetDecoder().GetCharCount(bytes, flush);
             return true;
         }
         catch (DecoderFallbackException)
@@ -469,59 +409,348 @@ public sealed class ContentSearchService
         }
     }
 
-    private sealed class QueryMatchState
+    private static bool HasUnicodeBom(ReadOnlySpan<byte> bytes) =>
+        bytes.StartsWith((ReadOnlySpan<byte>)[0xEF, 0xBB, 0xBF]) ||
+        bytes.StartsWith((ReadOnlySpan<byte>)[0xFF, 0xFE]) ||
+        bytes.StartsWith((ReadOnlySpan<byte>)[0xFE, 0xFF]) ||
+        bytes.StartsWith((ReadOnlySpan<byte>)[0x00, 0x00, 0xFE, 0xFF]);
+
+    // ───────────────────────── zip + XML documents ─────────────────────────
+
+    private static string? ZipFamily(string extension) => extension switch
     {
-        private readonly QueryExpression _expression;
-        private readonly bool[] _matchedTerms;
-        private readonly StringComparison _comparison;
-        private StreamingTermMatcher?[]? _matchers;
+        ".docx" or ".docm" or ".dotx" or ".dotm" => "word",
+        ".xlsx" or ".xlsm" or ".xltx" or ".xltm" => "xl",
+        ".pptx" or ".pptm" or ".potx" or ".potm" or ".ppsx" or ".ppsm" => "ppt",
+        ".hwpx" => "hwpx",
+        ".odt" or ".ods" or ".odp" or ".odg" => "odf",
+        _ => null
+    };
 
-        public QueryMatchState(QueryExpression expression, StringComparison comparison)
+    private static ReadStatus ReadZipXml(ScanNode node, ContentMatcher matcher, CancellationToken cancellationToken)
+    {
+        string family = ZipFamily(node.Extension)!;
+        using var stream = new FileStream(node.FullPath, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, 64 * 1024, FileOptions.RandomAccess);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: false);
+
+        if (archive.Entries.Count > MaximumOfficeArchiveEntries)
+            return ReadStatus.NotSearchable;
+
+        long expandedBytes = 0;
+        bool anyPart = false;
+        char[] valueBuffer = ArrayPool<char>.Shared.Rent(ReadBufferCharacters);
+        try
         {
-            _expression = expression;
-            _comparison = comparison;
-            _matchedTerms = new bool[expression.Terms.Count];
-        }
-
-        public bool IsMatch => _expression.Evaluate(_matchedTerms);
-
-        public void MatchWhole(string text)
-        {
-            for (int index = 0; index < _matchedTerms.Length; index++)
+            foreach (ZipArchiveEntry entry in archive.Entries
+                         .Where(entry => IsSearchableZipXml(entry.FullName, family))
+                         .OrderBy(entry => entry.FullName, StringComparer.OrdinalIgnoreCase))
             {
-                if (_matchedTerms[index] || !text.Contains(_expression.Terms[index], _comparison))
-                    continue;
+                cancellationToken.ThrowIfCancellationRequested();
+                if (entry.Length < 0 || expandedBytes > MaximumOfficeExpandedXmlBytes - entry.Length)
+                    return ReadStatus.NotSearchable;
+                expandedBytes += entry.Length;
+                anyPart = true;
 
-                _matchedTerms[index] = true;
-                if (IsMatch)
-                    return;
+                using Stream entryStream = entry.Open();
+                using XmlReader xml = XmlReader.Create(entryStream, new XmlReaderSettings
+                {
+                    DtdProcessing = DtdProcessing.Prohibit,
+                    XmlResolver = null,
+                    IgnoreComments = true,
+                    IgnoreProcessingInstructions = true
+                });
+
+                if (!xml.CanReadValueChunk)
+                    return ReadStatus.NotSearchable;
+
+                while (xml.Read())
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if ((xml.NodeType == XmlNodeType.EndElement && IsZipTextBoundary(xml.LocalName, entry.FullName, family)) ||
+                        (xml.NodeType == XmlNodeType.Element && IsZipExplicitBreak(xml.LocalName, family)))
+                    {
+                        if (matcher.Feed(" "))
+                            return ReadStatus.Decided;
+                        continue;
+                    }
+
+                    if (xml.NodeType is not (XmlNodeType.Text or XmlNodeType.CDATA or XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace))
+                        continue;
+
+                    while (true)
+                    {
+                        int read = xml.ReadValueChunk(valueBuffer, 0, ReadBufferCharacters);
+                        if (read == 0)
+                            break;
+                        if (matcher.Feed(valueBuffer.AsSpan(0, read)))
+                            return ReadStatus.Decided;
+                    }
+                }
+
+                if (matcher.Feed(" "))
+                    return ReadStatus.Decided;
             }
         }
-
-        public MatchDetails? Feed(ReadOnlySpan<char> characters)
+        finally
         {
-            if (characters.IsEmpty)
+            ArrayPool<char>.Shared.Return(valueBuffer);
+        }
+
+        return anyPart ? ReadStatus.Completed : ReadStatus.NotSearchable;
+    }
+
+    private static bool IsSearchableZipXml(string entryName, string family)
+    {
+        string normalized = entryName.Replace('\\', '/');
+        if (!normalized.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return family switch
+        {
+            "word" => normalized.Equals("word/document.xml", StringComparison.OrdinalIgnoreCase) ||
+                      normalized.StartsWith("word/header", StringComparison.OrdinalIgnoreCase) ||
+                      normalized.StartsWith("word/footer", StringComparison.OrdinalIgnoreCase) ||
+                      normalized.Equals("word/footnotes.xml", StringComparison.OrdinalIgnoreCase) ||
+                      normalized.Equals("word/endnotes.xml", StringComparison.OrdinalIgnoreCase) ||
+                      normalized.Equals("word/comments.xml", StringComparison.OrdinalIgnoreCase),
+            "xl" => normalized.Equals("xl/sharedStrings.xml", StringComparison.OrdinalIgnoreCase) ||
+                    normalized.StartsWith("xl/worksheets/", StringComparison.OrdinalIgnoreCase),
+            "ppt" => normalized.StartsWith("ppt/slides/slide", StringComparison.OrdinalIgnoreCase) ||
+                     normalized.StartsWith("ppt/notesSlides/notesSlide", StringComparison.OrdinalIgnoreCase),
+            "hwpx" => normalized.StartsWith("Contents/section", StringComparison.OrdinalIgnoreCase),
+            "odf" => normalized.Equals("content.xml", StringComparison.OrdinalIgnoreCase),
+            _ => false
+        };
+    }
+
+    private static bool IsZipTextBoundary(string localName, string entryName, string family)
+    {
+        switch (family)
+        {
+            case "word":
+            case "ppt":
+            case "hwpx":
+                return localName.Equals("p", StringComparison.OrdinalIgnoreCase);
+            case "odf":
+                return localName is "p" or "h" or "table-cell" or "list-item";
+            case "xl":
+                string normalized = entryName.Replace('\\', '/');
+                return normalized.Equals("xl/sharedStrings.xml", StringComparison.OrdinalIgnoreCase)
+                    ? localName.Equals("si", StringComparison.OrdinalIgnoreCase)
+                    : localName.Equals("c", StringComparison.OrdinalIgnoreCase);
+            default:
+                return false;
+        }
+    }
+
+    private static bool IsZipExplicitBreak(string localName, string family) => family switch
+    {
+        "word" => localName.Equals("br", StringComparison.OrdinalIgnoreCase) ||
+                  localName.Equals("cr", StringComparison.OrdinalIgnoreCase) ||
+                  localName.Equals("tab", StringComparison.OrdinalIgnoreCase),
+        "ppt" => localName.Equals("br", StringComparison.OrdinalIgnoreCase),
+        "hwpx" => localName is "lineBreak" or "tab",
+        "odf" => localName is "line-break" or "tab" or "s",
+        _ => false
+    };
+
+    // ───────────────────────── query plan ─────────────────────────
+
+    /// <summary>Per-search view of the expression: which terms are known from metadata and which need contents.</summary>
+    private sealed class SearchPlan
+    {
+        private readonly QueryExpression _expression;
+        private readonly SearchTerm[] _terms;
+        private readonly SearchMode _mode;
+        private readonly StringComparison _comparison;
+        private readonly bool _hasContentTerms;
+
+        public SearchPlan(QueryExpression expression, SearchOptions options)
+        {
+            _expression = expression;
+            _terms = expression.Terms.ToArray();
+            _mode = options.Mode;
+            _comparison = options.MatchCase ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            _hasContentTerms = _terms.Any(IsContentTerm);
+        }
+
+        private bool IsContentTerm(SearchTerm term) => term.Field switch
+        {
+            SearchTermField.Content => true,
+            SearchTermField.Default => _mode != SearchMode.FileName && !term.IsWildcard,
+            _ => false
+        };
+
+        public NameOutcome CheckName(ScanNode node, SearchPolicy.Eligibility flags)
+        {
+            string name = QueryExpression.Normalize(node.Name ?? string.Empty);
+            bool readable = _hasContentTerms && !node.IsDirectory &&
+                            (flags & SearchPolicy.Eligibility.ContentExcluded) == 0 &&
+                            FormatOf(node) != ContentFormat.None;
+            Span<sbyte> states = stackalloc sbyte[_terms.Length];
+            int quality = ComputeStates(node, name, readable, states, out bool nameMatched);
+            sbyte result = _expression.Evaluate(states);
+
+            if (result > 0)
+                return new NameOutcome(NameResult.Hit, quality,
+                    new SearchHit(node, nameMatched ? "Name" : "Condition", string.Empty));
+
+            return result == 0
+                ? new NameOutcome(NameResult.NeedsContent, 0, null)
+                : new NameOutcome(NameResult.None, 0, null);
+        }
+
+        /// <summary>Fills term states from metadata. Returns the best name-match quality (lower is better).</summary>
+        private int ComputeStates(ScanNode node, string name, bool readable, Span<sbyte> states, out bool nameMatched)
+        {
+            int quality = 9;
+            nameMatched = false;
+            for (int index = 0; index < _terms.Length; index++)
+            {
+                SearchTerm term = _terms[index];
+                sbyte state;
+                switch (term.Field)
+                {
+                    case SearchTermField.Default when term.IsWildcard:
+                    case SearchTermField.Name:
+                    case SearchTermField.Default when _mode != SearchMode.Contents:
+                        int found = NameMatching.Quality(term, name, node.IsDirectory, _comparison);
+                        if (found >= 0)
+                        {
+                            state = 1;
+                            nameMatched = true;
+                            quality = Math.Min(quality, found);
+                        }
+                        else
+                        {
+                            state = term.Field == SearchTermField.Default && !term.IsWildcard && _mode == SearchMode.NameOrContents && readable
+                                ? (sbyte)0
+                                : (sbyte)-1;
+                        }
+                        break;
+                    case SearchTermField.Default:
+                    case SearchTermField.Content:
+                        state = readable ? (sbyte)0 : (sbyte)-1;
+                        break;
+                    case SearchTermField.Path:
+                        state = (node.FullPath ?? string.Empty).Contains(term.Text, _comparison) ? (sbyte)1 : (sbyte)-1;
+                        break;
+                    case SearchTermField.Extension:
+                        state = !node.IsDirectory && Array.IndexOf(term.Extensions, node.Extension) >= 0 ? (sbyte)1 : (sbyte)-1;
+                        break;
+                    case SearchTermField.Size:
+                        state = node.Size >= term.MinimumSize && node.Size <= term.MaximumSize ? (sbyte)1 : (sbyte)-1;
+                        break;
+                    case SearchTermField.Modified:
+                        state = InDateRange(node.LastWriteTimeUtc, term) ? (sbyte)1 : (sbyte)-1;
+                        break;
+                    case SearchTermField.Kind:
+                        state = node.IsDirectory == term.WantsFolder ? (sbyte)1 : (sbyte)-1;
+                        break;
+                    default:
+                        state = -1;
+                        break;
+                }
+                states[index] = state;
+            }
+            return quality;
+        }
+
+        private static bool InDateRange(DateTime utc, SearchTerm term)
+        {
+            if (utc == default)
+                return false;
+            DateTime local = utc.ToLocalTime();
+            return (term.FromLocal is not { } from || local >= from) &&
+                   (term.BeforeLocal is not { } before || local < before);
+        }
+
+        public ContentMatcher CreateContentMatcher(ScanNode node)
+        {
+            string name = QueryExpression.Normalize(node.Name ?? string.Empty);
+            var states = new sbyte[_terms.Length];
+            ComputeStates(node, name, readable: true, states, out bool nameMatched);
+            return new ContentMatcher(_expression, _terms, states, _comparison, nameMatched);
+        }
+
+        public SearchHit? FinishContent(ScanNode node, ContentMatcher matcher, bool readable)
+        {
+            if (!readable && _mode == SearchMode.Contents)
                 return null;
+            if (matcher.Finish() <= 0)
+                return null;
+            if (matcher.Details is { } details)
+                return new SearchHit(node, "Contents", details.Preview, details.LineNumber);
+            return new SearchHit(node, matcher.NameMatched ? "Name" : "Condition", string.Empty);
+        }
+    }
+
+    /// <summary>Streams text through the unknown content terms and decides the expression as early as possible.</summary>
+    internal sealed class ContentMatcher
+    {
+        private readonly QueryExpression _expression;
+        private readonly SearchTerm[] _terms;
+        private readonly sbyte[] _states;
+        private readonly StringComparison _comparison;
+        private readonly StreamingTermMatcher?[] _matchers;
+        private sbyte _result;
+
+        public ContentMatcher(QueryExpression expression, SearchTerm[] terms, sbyte[] states, StringComparison comparison, bool nameMatched)
+        {
+            _expression = expression;
+            _terms = terms;
+            _states = states;
+            _comparison = comparison;
+            _matchers = new StreamingTermMatcher?[terms.Length];
+            NameMatched = nameMatched;
+            _result = expression.Evaluate(states);
+        }
+
+        public bool NameMatched { get; }
+        public MatchDetails? Details { get; private set; }
+
+        /// <summary>True once the outcome is decided and reading can stop.</summary>
+        public bool IsDecided => _result != 0;
+
+        public bool Feed(ReadOnlySpan<char> characters)
+        {
+            if (_result != 0)
+                return true;
+            if (characters.IsEmpty)
+                return false;
 
             string incoming = characters.ToString();
-            _matchers ??= new StreamingTermMatcher?[_matchedTerms.Length];
-            for (int index = 0; index < _matchedTerms.Length; index++)
+            for (int index = 0; index < _states.Length; index++)
             {
-                if (_matchedTerms[index])
+                if (_states[index] != 0)
                     continue;
 
-                StreamingTermMatcher matcher = _matchers[index] ??=
-                    new StreamingTermMatcher(_expression.Terms[index], _comparison);
+                StreamingTermMatcher matcher = _matchers[index] ??= new StreamingTermMatcher(_terms[index].Text, _comparison);
                 MatchDetails? match = matcher.Feed(incoming);
                 if (match is null)
                     continue;
 
-                _matchedTerms[index] = true;
-                if (IsMatch)
-                    return match;
+                _states[index] = 1;
+                Details ??= match;
+                _result = _expression.Evaluate(_states);
+                if (_result != 0)
+                    return true;
             }
+            return false;
+        }
 
-            return null;
+        public sbyte Finish()
+        {
+            if (_result != 0)
+                return _result;
+            for (int index = 0; index < _states.Length; index++)
+            {
+                if (_states[index] == 0)
+                    _states[index] = -1;
+            }
+            _result = _expression.Evaluate(_states);
+            return _result;
         }
     }
 
@@ -589,30 +818,16 @@ public sealed class ContentSearchService
             return null;
         }
 
-        private MatchDetails CreateMatch(
-            string text,
-            int index,
-            long startingLine,
-            bool pendingCarriageReturn)
-        {
-            long line = CountLineAt(text.AsSpan(0, index), startingLine, pendingCarriageReturn);
-            int previewStart = Math.Max(0, index - PreviewRadius);
-            int previewEnd = Math.Min(text.Length, index + _query.Length + PreviewRadius);
-            string preview = NormalizePreview(text[previewStart..previewEnd]);
-            return new MatchDetails(preview, line);
-        }
-
-        private static long CountLineAt(ReadOnlySpan<char> text, long startingLine, bool pendingCarriageReturn)
+        private MatchDetails CreateMatch(string text, int index, long startingLine, bool pendingCarriageReturn)
         {
             long line = startingLine;
-            AdvanceLineState(text, ref line, ref pendingCarriageReturn);
-            return line;
+            AdvanceLineState(text.AsSpan(0, index), ref line, ref pendingCarriageReturn);
+            int previewStart = Math.Max(0, index - PreviewRadius);
+            int previewEnd = Math.Min(text.Length, index + _query.Length + PreviewRadius);
+            return new MatchDetails(NormalizePreview(text[previewStart..previewEnd]), line);
         }
 
-        private static void AdvanceLineState(
-            ReadOnlySpan<char> text,
-            ref long line,
-            ref bool pendingCarriageReturn)
+        private static void AdvanceLineState(ReadOnlySpan<char> text, ref long line, ref bool pendingCarriageReturn)
         {
             foreach (char value in text)
             {
@@ -640,7 +855,7 @@ public sealed class ContentSearchService
             bool previousWhitespace = false;
             foreach (char value in preview)
             {
-                bool whitespace = char.IsWhiteSpace(value);
+                bool whitespace = char.IsWhiteSpace(value) || char.IsControl(value);
                 if (!whitespace || !previousWhitespace)
                     builder.Append(whitespace ? ' ' : value);
                 previousWhitespace = whitespace;
@@ -649,12 +864,110 @@ public sealed class ContentSearchService
         }
     }
 
-    private sealed record Candidate(ScanNode Node, string Name);
-    private sealed record Preparation(List<Candidate> Eligible, long Excluded);
-    private sealed record MatchDetails(string Preview, long LineNumber);
-    private readonly record struct SearchOutcome(SearchHit? Hit, bool Skipped)
+    // ───────────────────────── ranking ─────────────────────────
+
+    private readonly record struct RankKey(int Quality, int OperatingSystem, int Noisy, int File, int Depth, int NameLength, string Path)
+        : IComparable<RankKey>
     {
-        public static SearchOutcome NoMatch => new(null, false);
-        public static SearchOutcome NotSearchable => new(null, true);
+        public static RankKey Create(ScanNode node, SearchPolicy.Eligibility flags, int quality)
+        {
+            string path = node.FullPath ?? string.Empty;
+            int depth = 0;
+            foreach (char value in path)
+            {
+                if (value is '\\' or '/')
+                    depth++;
+            }
+            return new RankKey(quality,
+                (flags & SearchPolicy.Eligibility.OperatingSystem) != 0 ? 1 : 0,
+                (flags & SearchPolicy.Eligibility.Noisy) != 0 ? 1 : 0,
+                node.IsDirectory ? 0 : 1,
+                depth,
+                (node.Name ?? string.Empty).Length,
+                path);
+        }
+
+        public int CompareTo(RankKey other)
+        {
+            int result = Quality.CompareTo(other.Quality);
+            if (result == 0) result = OperatingSystem.CompareTo(other.OperatingSystem);
+            if (result == 0) result = Noisy.CompareTo(other.Noisy);
+            if (result == 0) result = File.CompareTo(other.File);
+            if (result == 0) result = Depth.CompareTo(other.Depth);
+            if (result == 0) result = NameLength.CompareTo(other.NameLength);
+            if (result == 0) result = StringComparer.OrdinalIgnoreCase.Compare(Path, other.Path);
+            return result;
+        }
     }
+
+    private enum NameResult : byte { None, Excluded, Hit, NeedsContent }
+    private readonly record struct NameOutcome(NameResult Result, int Quality, SearchHit? Hit);
+    private sealed record RankedHit(SearchHit Hit, RankKey Key);
+    private sealed record NamePass(List<RankedHit> Exact, List<ScanNode> ContentCandidates,
+        Dictionary<ScanNode, SearchPolicy.Eligibility> Flags, long Examined, long Excluded);
+    internal sealed record MatchDetails(string Preview, long LineNumber);
+    private readonly record struct ContentOutcome(SearchHit? Hit, bool Skipped);
+}
+
+/// <summary>Name comparison helpers: match quality and wildcards.</summary>
+internal static class NameMatching
+{
+    /// <summary>-1 when the term does not match the name; otherwise 0 (whole name) … 3 (inside a word).</summary>
+    public static int Quality(SearchTerm term, string name, bool isDirectory, StringComparison comparison)
+    {
+        bool ignoreCase = comparison != StringComparison.Ordinal;
+        string stem = isDirectory ? name : Path.GetFileNameWithoutExtension(name);
+        if (term.IsWildcard)
+        {
+            if (Wildcard(term.Text, name, ignoreCase))
+                return 1;
+            return !term.Text.Contains('.') && !isDirectory && Wildcard(term.Text, stem, ignoreCase) ? 1 : -1;
+        }
+
+        int index = name.IndexOf(term.Text, comparison);
+        if (index < 0)
+            return -1;
+        if (name.Length == term.Text.Length || (stem.Length == term.Text.Length && index == 0))
+            return 0;
+        if (index == 0)
+            return 1;
+        char previous = name[index - 1];
+        if (!char.IsLetterOrDigit(previous) || (char.IsLower(previous) && char.IsUpper(name[index])))
+            return 2;
+        return 3;
+    }
+
+    /// <summary>* matches any run of characters and ? one character; the whole text must match.</summary>
+    public static bool Wildcard(string pattern, string text, bool ignoreCase)
+    {
+        int p = 0, t = 0, star = -1, mark = 0;
+        while (t < text.Length)
+        {
+            if (p < pattern.Length && (pattern[p] == '?' || Same(pattern[p], text[t], ignoreCase)))
+            {
+                p++;
+                t++;
+            }
+            else if (p < pattern.Length && pattern[p] == '*')
+            {
+                star = p++;
+                mark = t;
+            }
+            else if (star >= 0)
+            {
+                p = star + 1;
+                t = ++mark;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        while (p < pattern.Length && pattern[p] == '*')
+            p++;
+        return p == pattern.Length;
+    }
+
+    private static bool Same(char left, char right, bool ignoreCase) =>
+        left == right || (ignoreCase && char.ToUpperInvariant(left) == char.ToUpperInvariant(right));
 }

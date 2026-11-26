@@ -1,4 +1,5 @@
-﻿using System.Collections.ObjectModel;
+﻿using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -6,6 +7,7 @@ using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Threading;
 using DiskScan.Core;
 using Microsoft.Win32;
 
@@ -43,7 +45,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private ScanNode? _selectedNode;
     private IReadOnlyList<FileRow> _largeFiles = [];
     private IReadOnlyList<ExtensionRow> _extensions = [];
-    private IReadOnlyList<SearchResultRow> _searchResults = [];
+    private ObservableCollection<SearchResultRow> _searchResults = [];
+    private DateTime _scanCompletedUtc;
+    private long _lastImeSearchTicks;
+    private const int MaxSearchResults = 10000;
+    // A file list older than this is read again before searching, so new files are found.
+    private static readonly TimeSpan ScanFreshFor = TimeSpan.FromMinutes(5);
     private IReadOnlyList<DuplicateFileRow> _duplicateRows = [];
     private IReadOnlyList<DuplicateGroup> _duplicateGroups = [];
     private IReadOnlyList<string> _duplicateFailures = [];
@@ -58,6 +65,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _duplicateDeletionService = new DuplicateDeletionService(duplicateRecycler);
         _duplicateConfirmation = duplicateConfirmation;
         SearchModes = [new("파일 이름", SearchMode.FileName), new("파일 내용", SearchMode.Contents), new("이름 또는 내용", SearchMode.NameOrContents)];
+        KindChoices =
+        [
+            new("전체", ""), new("폴더", "type:folder"),
+            new("문서", "ext:pdf;hwp;hwpx;doc;docx;xls;xlsx;xlsm;ppt;pptx;txt;md;csv"),
+            new("PDF", "ext:pdf"), new("한글", "ext:hwp;hwpx"), new("워드", "ext:doc;docx"), new("엑셀", "ext:xls;xlsx;xlsm;csv"),
+            new("파워포인트", "ext:ppt;pptx"), new("이미지", "ext:jpg;jpeg;png;gif;bmp;webp;heic;tif;tiff"),
+            new("동영상", "ext:mp4;mkv;avi;mov;wmv;webm"), new("음악", "ext:mp3;wav;flac;m4a;aac;ogg"),
+            new("압축 파일", "ext:zip;7z;rar;tar;gz"), new("실행 파일", "ext:exe;msi")
+        ];
+        SizeChoices = [new("전체", ""), new("1MB 이상", "size:>=1mb"), new("10MB 이상", "size:>=10mb"), new("100MB 이상", "size:>=100mb"), new("1GB 이상", "size:>=1gb"), new("1MB 미만", "size:<1mb")];
+        DateChoices = [new("전체", ""), new("오늘", "date:today"), new("7일 이내", "date:7d"), new("30일 이내", "date:30d"), new("1년 이내", "date:1y"), new("1년 넘음", "date:>1y")];
         MetricChoices = [new("논리 크기 기준", false), new("할당 크기 기준", true)];
         Resources.MergedDictionaries.Add(CreateAppResources());
         InitializeComponent();
@@ -79,10 +97,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public ObservableCollection<FolderRow> FolderRows { get; } = [];
     public IReadOnlyList<FileRow> LargeFiles { get => _largeFiles; private set => Set(ref _largeFiles, value); }
     public IReadOnlyList<ExtensionRow> Extensions { get => _extensions; private set => Set(ref _extensions, value); }
-    public IReadOnlyList<SearchResultRow> SearchResults { get => _searchResults; private set => Set(ref _searchResults, value); }
+    public ObservableCollection<SearchResultRow> SearchResults { get => _searchResults; private set => Set(ref _searchResults, value); }
     public IReadOnlyList<DuplicateFileRow> DuplicateRows { get => _duplicateRows; private set => Set(ref _duplicateRows, value); }
     public IReadOnlyList<string> DuplicateFailures { get => _duplicateFailures; private set => Set(ref _duplicateFailures, value); }
     public IReadOnlyList<SearchModeChoice> SearchModes { get; }
+    public IReadOnlyList<ConditionChoice> KindChoices { get; }
+    public IReadOnlyList<ConditionChoice> SizeChoices { get; }
+    public IReadOnlyList<ConditionChoice> DateChoices { get; }
     public IReadOnlyList<MetricBasisChoice> MetricChoices { get; }
     public ScanResult? CurrentScan { get; private set; }
     public string LogicalSizeText { get => _logicalSizeText; private set => Set(ref _logicalSizeText, value); }
@@ -168,8 +189,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (_optimizationBusy) return;
         MainTabs.SelectedIndex = 2;
         if (!ScanButton.IsEnabled) { SearchStatusText.Text = "디스크 분석이 끝난 뒤 검색할 수 있습니다."; return; }
-        if (string.IsNullOrWhiteSpace(query)) { SearchStatusText.Text = "파일 이름이나 내용 검색어를 입력하세요."; SearchBox.Focus(); return; }
-        try { QueryExpression.Parse(query); }
+        query = (query ?? "").Trim();
+        var conditions = BuildConditions();
+        if (query.Length == 0 && conditions.Length == 0) { SearchStatusText.Text = "검색어를 입력하거나 옵션에서 조건을 고르세요."; SearchBox.Focus(); return; }
+        try { QueryExpression.Parse(query, conditions); }
         catch (ArgumentException error)
         {
             SearchStatusText.Text = error.Message;
@@ -181,20 +204,26 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         string requestedPath;
         try { requestedPath = Path.GetFullPath(Environment.ExpandEnvironmentVariables(PathBox.Text.Trim().Trim('"'))); }
         catch { SearchStatusText.Text = "위에서 검색할 드라이브나 폴더를 선택하세요."; return; }
-        static bool SamePath(string first, string second) => string.Equals(Path.TrimEndingDirectorySeparator(first), Path.TrimEndingDirectorySeparator(second), StringComparison.OrdinalIgnoreCase);
-        if (CurrentScan is null || !SamePath(CurrentScan.Root.FullPath, requestedPath))
+
+        // A folder inside the current analysis is searched from it directly. A missing
+        // or old file list is read again first, so files created since then are found.
+        var scope = FindScope(CurrentScan, requestedPath);
+        if (scope is null || DateTime.UtcNow - _scanCompletedUtc > ScanFreshFor)
         {
             var previousScan = CurrentScan;
-            SearchStatusText.Text = "검색할 위치의 파일 목록을 준비합니다. 분석을 취소하면 검색도 중단됩니다.";
-            await ScanPathAsync(requestedPath);
-            if (CurrentScan is null || ReferenceEquals(CurrentScan, previousScan) || !SamePath(CurrentScan.Root.FullPath, requestedPath))
+            var scanPath = scope is null ? requestedPath : CurrentScan!.Root.FullPath;
+            SearchStatusText.Text = scope is null ? "검색할 위치의 파일 목록을 준비합니다…" : "최신 파일 목록을 다시 읽습니다…";
+            await ScanPathAsync(scanPath);
+            PathBox.Text = requestedPath;
+            scope = ReferenceEquals(CurrentScan, previousScan) ? null : FindScope(CurrentScan, requestedPath);
+            if (scope is null)
             {
                 SearchStatusText.Text = "파일 목록을 준비하지 못했거나 취소했습니다. 위치를 확인하고 다시 검색하세요.";
                 return;
             }
             MainTabs.SelectedIndex = 2;
         }
-        var scan = CurrentScan;
+        var scan = CurrentScan!;
 
         var generation = Interlocked.Increment(ref _searchGeneration);
         _searchCancellation?.Cancel();
@@ -203,31 +232,57 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var token = _searchCancellation.Token;
         SearchButton.IsEnabled = false; SearchCancelButton.IsEnabled = true;
         FindDuplicatesButton.IsEnabled = false;
-        SearchStatusText.Text = $"{scan.Root.FullPath} 검색 중…";
         BusyProgress.Visibility = Visibility.Visible;
+        var conditionNote = conditions.Length > 0 ? "조건 적용 · " : "";
+        SearchStatusText.Text = $"{conditionNote}{scope.FullPath} 검색 중…";
+
+        // Hits arrive in batches from worker threads: names first, then contents as files are read.
+        var rows = new ObservableCollection<SearchResultRow>();
+        SearchResults = rows;
+        var pending = new ConcurrentQueue<IReadOnlyList<SearchHit>>();
+        void Drain()
+        {
+            if (generation != _searchGeneration) return;
+            var batch = new List<SearchResultRow>();
+            while (pending.TryDequeue(out var hits)) foreach (var hit in hits) batch.Add(new SearchResultRow(hit));
+            if (batch.Count == 0) return;
+            if (rows.Count == 0) { rows = new ObservableCollection<SearchResultRow>(batch); SearchResults = rows; }
+            else foreach (var row in batch) rows.Add(row);
+        }
+        var drainTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(150), DispatcherPriority.Background, (_, _) => Drain(), Dispatcher);
         var acceptingProgress = true;
         var progress = new Progress<SearchProgress>(p =>
         {
-            if (acceptingProgress && generation == _searchGeneration)
-                SearchStatusText.Text = $"{p.Total:N0}개 중 {p.Examined:N0}개 확인 · 일치 {p.Matches:N0}개";
+            if (!acceptingProgress || generation != _searchGeneration) return;
+            SearchStatusText.Text = p.Total > 0
+                ? $"{conditionNote}결과 {p.Matches:N0}개 · 파일 내용 {p.Examined:N0} / {p.Total:N0} 확인 중…"
+                : $"{conditionNote}결과 {p.Matches:N0}개";
         });
 
         try
         {
-            var options = new SearchOptions(query.Trim(), mode, MatchCaseBox.IsChecked == true, 10000);
-            var report = await _searchService.SearchAsync(scan.Files, options, progress, token);
+            drainTimer.Start();
+            var nodes = await Task.Run(() => Descendants(scope), token);
+            var options = new SearchOptions(query, mode, MatchCaseBox.IsChecked == true, MaxSearchResults, conditions);
+            var report = await _searchService.SearchAsync(nodes, options, progress, token, new QueueProgress(pending));
             if (generation != _searchGeneration || token.IsCancellationRequested || !ReferenceEquals(scan, CurrentScan)) return;
-            var rows = await Task.Run(() => report.Hits.Select(h => new SearchResultRow(h)).ToArray(), token);
-            if (generation != _searchGeneration || token.IsCancellationRequested || !ReferenceEquals(scan, CurrentScan)) return;
-            SearchResults = rows;
+            Drain();
             acceptingProgress = false;
             ILuncher.AppKit.AppUsage.Count("search");
-            var limit = report.LimitReached ? " · 표시 한도 10,000개 도달" : "";
-            SearchStatusText.Text = $"결과 {report.Hits.Count:N0}개 · 확인 {report.Examined:N0}개 · 시스템 제외 {report.Excluded:N0}개 · {Format.Duration(report.Elapsed)}{limit}";
+            var parts = new List<string> { $"결과 {report.Hits.Count:N0}개" };
+            if (report.LimitReached) parts.Add($"최대 {MaxSearchResults:N0}개까지 표시");
+            if (report.ContentFiles > 0) parts.Add($"파일 내용 {report.ContentFiles:N0}개 확인");
+            parts.Add(Format.Duration(report.Elapsed));
+            if (DateTime.UtcNow - _scanCompletedUtc > TimeSpan.FromMinutes(1)) parts.Add($"{_scanCompletedUtc.ToLocalTime():HH:mm} 파일 목록 기준");
+            SearchStatusText.Text = conditionNote + string.Join(" · ", parts);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            if (generation == _searchGeneration) SearchStatusText.Text = "검색을 취소했습니다. 이전 결과는 그대로 유지됩니다.";
+            if (generation == _searchGeneration)
+            {
+                Drain();
+                SearchStatusText.Text = $"검색을 취소했습니다 · 그때까지 찾은 결과 {SearchResults.Count:N0}개";
+            }
         }
         catch (Exception ex)
         {
@@ -235,6 +290,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         finally
         {
+            drainTimer.Stop();
             acceptingProgress = false;
             if (generation == _searchGeneration)
             {
@@ -243,6 +299,69 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 if (_scanCancellation is null || _scanCancellation.IsCancellationRequested || ScanButton.IsEnabled) BusyProgress.Visibility = Visibility.Collapsed;
             }
         }
+    }
+
+    /// <summary>The scanned folder for a path inside the current analysis, or null.</summary>
+    private static ScanNode? FindScope(ScanResult? scan, string path)
+    {
+        if (scan is null) return null;
+        var root = Path.TrimEndingDirectorySeparator(scan.Root.FullPath);
+        var target = Path.TrimEndingDirectorySeparator(path);
+        if (target.Equals(root, StringComparison.OrdinalIgnoreCase)) return scan.Root;
+        var prefix = root.EndsWith('\\') ? root : root + "\\";
+        if (!target.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return null;
+        var node = scan.Root;
+        foreach (var segment in target[prefix.Length..].Split('\\', StringSplitOptions.RemoveEmptyEntries))
+        {
+            node = node.Children.FirstOrDefault(child => child.IsDirectory && child.Name.Equals(segment, StringComparison.OrdinalIgnoreCase));
+            if (node is null) return null;
+        }
+        return node;
+    }
+
+    /// <summary>Every file and folder below the scope (not the scope itself).</summary>
+    private static List<ScanNode> Descendants(ScanNode scope)
+    {
+        var result = new List<ScanNode>(Math.Max(16, (int)Math.Min(scope.FileCount * 2, 4_000_000)));
+        var stack = new Stack<ScanNode>();
+        stack.Push(scope);
+        while (stack.Count > 0)
+        {
+            foreach (var child in stack.Pop().Children)
+            {
+                result.Add(child);
+                if (child.IsDirectory) stack.Push(child);
+            }
+        }
+        return result;
+    }
+
+    private string BuildConditions()
+    {
+        var values = new[] { KindBox?.SelectedItem, SizeBox?.SelectedItem, DateBox?.SelectedItem }
+            .OfType<ConditionChoice>().Select(choice => choice.Value).Where(value => value.Length > 0);
+        return string.Join(" ", values);
+    }
+
+    private void Condition_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (ConditionDot is null || ClearConditionsButton is null) return;
+        var active = BuildConditions().Length > 0;
+        ConditionDot.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
+        ClearConditionsButton.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
+        OptionsToggle.ToolTip = active ? "검색 조건 적용 중 · 옵션" : "검색 및 크기 기준 옵션";
+    }
+
+    private void ClearConditions_Click(object sender, RoutedEventArgs e)
+    {
+        KindBox.SelectedIndex = 0;
+        SizeBox.SelectedIndex = 0;
+        DateBox.SelectedIndex = 0;
+    }
+
+    private sealed class QueueProgress(ConcurrentQueue<IReadOnlyList<SearchHit>> queue) : IProgress<IReadOnlyList<SearchHit>>
+    {
+        public void Report(IReadOnlyList<SearchHit> value) => queue.Enqueue(value);
     }
 
     private void ApplyScan(ScanResult scan, PreparedScan prepared, bool useAllocated)
@@ -263,7 +382,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         LargeFiles = prepared.LargeFiles;
         Extensions = prepared.Extensions;
         SearchResults = [];
-        SearchStatusText.Text = "선택한 위치에서 검색 · 시스템 파일 제외";
+        _scanCompletedUtc = DateTime.UtcNow;
+        SearchStatusText.Text = "선택한 위치의 이름과 내용을 검색합니다";
         _navigation.Clear();
         ShowFolder(scan.Root, false);
 
@@ -743,7 +863,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void Scan_Click(object sender, RoutedEventArgs e) => await ScanPathAsync(PathBox.Text);
     private void Cancel_Click(object sender, RoutedEventArgs e) => _scanCancellation?.Cancel();
-    private async void Search_Click(object sender, RoutedEventArgs e) => await SearchAsync(SearchBox.Text, SearchModeBox.SelectedItem is SearchModeChoice choice ? choice.Mode : SearchMode.NameOrContents);
+    private SearchMode CurrentSearchMode => SearchModeBox.SelectedItem is SearchModeChoice choice ? choice.Mode : SearchMode.NameOrContents;
+    private async void Search_Click(object sender, RoutedEventArgs e) => await SearchAsync(SearchBox.Text, CurrentSearchMode);
     private void ExtensionGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         var extension = (ExtensionGrid.SelectedItem as ExtensionRow)?.Extension;
@@ -768,7 +889,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     }
     private void OpenDuplicateFolder_Click(object sender, RoutedEventArgs e) { if (DuplicateGrid.SelectedItem is DuplicateFileRow row) OpenPath(row.Node); }
     private async void PathBox_KeyDown(object sender, KeyEventArgs e) { if (e.Key == Key.Enter) { e.Handled = true; await ScanPathAsync(PathBox.Text); } }
-    private async void SearchBox_KeyDown(object sender, KeyEventArgs e) { if (e.Key == Key.Enter) { e.Handled = true; await SearchAsync(SearchBox.Text, SearchModeBox.SelectedItem is SearchModeChoice choice ? choice.Mode : SearchMode.NameOrContents); } }
+    private async void SearchBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        // With Korean input the first Enter also finishes the syllable being typed; it
+        // arrives as ImeProcessed. Search once the finished text is in the box.
+        if (e.Key == Key.ImeProcessed && e.ImeProcessedKey == Key.Enter)
+        {
+            _lastImeSearchTicks = Environment.TickCount64;
+            await Dispatcher.Yield(DispatcherPriority.Background);
+            await SearchAsync(SearchBox.Text, CurrentSearchMode);
+            return;
+        }
+        if (e.Key != Key.Enter) return;
+        e.Handled = true;
+        if (Environment.TickCount64 - _lastImeSearchTicks < 400) return;
+        await SearchAsync(SearchBox.Text, CurrentSearchMode);
+    }
     private async void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key == Key.F && Keyboard.Modifiers == ModifierKeys.Control)

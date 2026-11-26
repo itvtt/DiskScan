@@ -21,9 +21,11 @@ public sealed record ScanSummary(long Files, long Directories, long Skipped, Tim
 public sealed record ScanResult(ScanNode Root, IReadOnlyList<ScanNode> Files, ScanSummary Summary);
 
 public enum SearchMode { FileName, Contents, NameOrContents }
+/// <summary>Search request. Conditions (for example "ext:pdf size:>1mb") must match together with Query.</summary>
 public sealed record SearchOptions(string Query, SearchMode Mode = SearchMode.NameOrContents,
-    bool MatchCase = false, int MaxResults = 10000);
-public sealed record SearchHit(ScanNode Node, string MatchKind, string Preview, long LineNumber = 0);
+    bool MatchCase = false, int MaxResults = 10000, string? Conditions = null);
 public sealed record SearchProgress(long Examined, long Total, long Matches, long Skipped);
+/// <summary>MatchKind is "Name", "Contents" or "Condition" (matched by conditions such as ext: or size: only).</summary>
+public sealed record SearchHit(ScanNode Node, string MatchKind, string Preview, long LineNumber = 0);
 public sealed record SearchReport(IReadOnlyList<SearchHit> Hits, long Examined, long Excluded,
-    long Skipped, bool LimitReached, TimeSpan Elapsed);
+    long Skipped, bool LimitReached, TimeSpan Elapsed, long ContentFiles = 0);

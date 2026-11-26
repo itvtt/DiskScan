@@ -229,8 +229,28 @@ internal static class Program
                 Check(results.Items.Count == 0, "No-match search clears stale results");
                 ((TextBox)window.FindName("PathBox")).Text = Path.Combine(fixture, "Media");
                 await window.SearchAsync("design-assets", SearchMode.FileName);
-                Check(window.SearchResults.Count == 1 && window.CurrentScan!.Root.FullPath.TrimEnd('\\') == Path.Combine(fixture, "Media"),
-                    "Changing the path searches the newly selected scope rather than stale scan results");
+                var mediaPrefix = Path.Combine(fixture, "Media") + "\\";
+                Check(window.SearchResults.Count == 1 && window.SearchResults.All(row => row.Node.FullPath.StartsWith(mediaPrefix, StringComparison.OrdinalIgnoreCase)),
+                    "Changing the path to a folder inside the analysis searches only that folder");
+                await window.SearchAsync("release-backup", SearchMode.FileName);
+                Check(window.SearchResults.Count == 0, "Files outside the selected folder are not returned");
+                ((TextBox)window.FindName("PathBox")).Text = fixture;
+                await window.SearchAsync("Media", SearchMode.FileName);
+                Check(window.SearchResults.Count >= 1 && window.SearchResults[0].Node.IsDirectory && window.SearchResults[0].MatchKind == "폴더",
+                    "Folders are found by name and listed first");
+                var sizeBox = (ComboBox)window.FindName("SizeBox");
+                sizeBox.SelectedIndex = 2; // 10MB 이상
+                await window.SearchAsync("design", SearchMode.FileName);
+                Check(window.SearchResults.Count == 1 && window.SearchResults[0].Node.Name == "design-assets.psd"
+                      && ((FrameworkElement)window.FindName("ConditionDot")).Visibility == Visibility.Visible,
+                    "The size condition from the options filters results and marks the options button");
+                ((Button)window.FindName("ClearConditionsButton")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                Check(sizeBox.SelectedIndex == 0 && ((FrameworkElement)window.FindName("ConditionDot")).Visibility == Visibility.Collapsed,
+                    "Clearing conditions resets them");
+                await window.SearchAsync("design ext:md", SearchMode.FileName);
+                Check(window.SearchResults.Count == 1 && window.SearchResults[0].Node.Name == "design-notes.md", "Typed ext: condition works in the search box");
+                await window.SearchAsync("ScanNeedle42 -name:design", SearchMode.Contents);
+                Check(window.SearchResults.Count == 0, "A leading - with name: excludes files by name in content search");
                 await window.ScanPathAsync(fixture);
 
                 var filesGrid = (DataGrid)window.FindName("LargeFilesGrid");

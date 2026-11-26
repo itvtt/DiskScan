@@ -58,9 +58,22 @@ public sealed class SearchResultRow : IPathItem
     public ScanNode Node { get; }
     public string Name => Node.Name;
     public string Directory => Path.GetDirectoryName(Node.FullPath) ?? "";
-    public string MatchKind => Hit.MatchKind.Equals("Name", StringComparison.OrdinalIgnoreCase) ? "이름" : Hit.MatchKind.Equals("Contents", StringComparison.OrdinalIgnoreCase) ? "내용" : Hit.MatchKind;
+    public string MatchKind => Hit.MatchKind switch
+    {
+        "Name" => Node.IsDirectory ? "폴더" : "이름",
+        "Contents" => "내용",
+        "Condition" => Node.IsDirectory ? "폴더" : "조건",
+        _ => Hit.MatchKind
+    };
     public string Preview => Hit.LineNumber > 0 ? $"{Hit.LineNumber:N0}줄 · {Hit.Preview}" : Hit.Preview;
     public string SizeText => Format.Bytes(Node.Size);
+    public string ModifiedText => Format.Date(Node.LastWriteTimeUtc);
+}
+
+/// <summary>A labelled condition choice for the search options; Value is query syntax such as "size:>=1mb".</summary>
+public sealed record ConditionChoice(string Label, string Value)
+{
+    public override string ToString() => Label;
 }
 
 public sealed record DriveItem(string Label, string Path)
