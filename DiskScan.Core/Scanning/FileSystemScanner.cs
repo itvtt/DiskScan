@@ -98,7 +98,6 @@ internal static class FileSystemScanner
                 var node = new ScanNode
                 {
                     Name = item.Name,
-                    FullPath = item.FullPath,
                     IsDirectory = item.IsDirectory,
                     Size = item.Length,
                     AllocatedSize = allocated,

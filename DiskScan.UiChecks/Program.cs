@@ -135,6 +135,7 @@ internal static class Program
                     (FrameworkElement)window.FindName("PathBox"),
                     (FrameworkElement)window.FindName("DriveBox"),
                     (FrameworkElement)window.FindName("ScanButton"),
+                    (FrameworkElement)window.FindName("SearchScopeBox"),
                     searchInput,
                     (FrameworkElement)window.FindName("SearchButton")
                 };
@@ -251,6 +252,29 @@ internal static class Program
                 Check(window.SearchResults.Count == 1 && window.SearchResults[0].Node.Name == "design-notes.md", "Typed ext: condition works in the search box");
                 await window.SearchAsync("ScanNeedle42 -name:design", SearchMode.Contents);
                 Check(window.SearchResults.Count == 0, "A leading - with name: excludes files by name in content search");
+                var otherDrive = fixture + "-other-drive";
+                Directory.CreateDirectory(Path.Combine(otherDrive, "notes"));
+                File.WriteAllText(Path.Combine(otherDrive, "notes", "drive-plan.txt"), "ScanNeedle42 on another drive");
+                window.SearchDriveRoots = () => [Path.Combine(fixture, "Projects"), otherDrive];
+                var scopeBox = (ComboBox)window.FindName("SearchScopeBox");
+                var scanBeforeAllDrives = window.CurrentScan;
+                scopeBox.SelectedIndex = 1;
+                var allDrivesStatus = (TextBlock)window.FindName("SearchStatusText");
+                Check(allDrivesStatus.Text.Contains("모든 드라이브(Projects " + Path.GetFileName(otherDrive) + ")"), "Choosing all drives names the drives it will search");
+                await window.SearchAsync("ScanNeedle42", SearchMode.Contents);
+                Check(window.SearchResults.Count == 2
+                      && window.SearchResults.Any(row => row.Node.Name == "design-notes.md")
+                      && window.SearchResults.Any(row => row.Node.Name == "drive-plan.txt")
+                      && ReferenceEquals(scanBeforeAllDrives, window.CurrentScan),
+                    "All drives finds matches on every drive and leaves the analysis on screen");
+                Check(allDrivesStatus.Text.Contains("드라이브 Projects " + Path.GetFileName(otherDrive)), "All-drives status lists the searched drives");
+                await window.SearchAsync("drive-plan OR design-assets", SearchMode.FileName);
+                Check(window.SearchResults.Count == 1 && window.SearchResults[0].Node.Name == "drive-plan.txt",
+                    "All drives searches only the drive roots it lists");
+                Capture("DiskScan-all-drives.png");
+                scopeBox.SelectedIndex = 0;
+                await window.SearchAsync("drive-plan", SearchMode.FileName);
+                Check(window.SearchResults.Count == 0, "The selected location is searched again after switching back");
                 await window.ScanPathAsync(fixture);
 
                 var filesGrid = (DataGrid)window.FindName("LargeFilesGrid");

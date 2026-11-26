@@ -44,9 +44,9 @@
 
             <Grid x:Name="SearchToolbar" Grid.Row="1" Height="36" Margin="14,10,14,10">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="120"/><ColumnDefinition Width="0.85*"/><ColumnDefinition Width="40"/>
+                    <ColumnDefinition Width="120"/><ColumnDefinition Width="0.7*"/><ColumnDefinition Width="40"/>
                     <ColumnDefinition Width="70"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="25"/>
-                    <ColumnDefinition Width="1.15*"/><ColumnDefinition Width="70"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="42"/>
+                    <ColumnDefinition Width="1.3*"/><ColumnDefinition Width="70"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="42"/>
                 </Grid.ColumnDefinitions>
                 <ComboBox x:Name="DriveBox" Height="36" Margin="0,0,8,0" DisplayMemberPath="Label" SelectionChanged="DriveBox_SelectionChanged" ToolTip="드라이브 선택"/>
                 <TextBox x:Name="PathBox" Grid.Column="1" Height="36" VerticalContentAlignment="Center" AutomationProperties.Name="폴더 경로" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" KeyDown="PathBox_KeyDown"/>
@@ -55,8 +55,10 @@
                 <Button x:Name="CancelButton" Grid.Column="4" AutomationProperties.AutomationId="CancelButton" Style="{StaticResource CancelActionButton}" Padding="10,0" Content="취소" Margin="6,0,0,0" IsEnabled="False" Click="Cancel_Click"/>
                 <Border Grid.Column="5" Width="1" Margin="0,6" Background="{StaticResource StrokeBrush}"/>
                 <Grid Grid.Column="6">
-                    <TextBox x:Name="SearchBox" AutomationProperties.AutomationId="SearchBox" Height="36" VerticalContentAlignment="Center" ToolTip="띄어쓰기: 모두 포함 · A OR B: 하나 이상 · -단어: 제외 · &quot;문구&quot;: 그대로 · ext:pdf size:&gt;1mb date:7d · Ctrl+F" AutomationProperties.Name="파일 이름 또는 내용 검색어" KeyDown="SearchBox_KeyDown"/>
-                    <TextBlock Text="{Binding SelectedItem.Label, ElementName=SearchModeBox, StringFormat={}{0} 검색}" Margin="10,0" VerticalAlignment="Center" Foreground="#6B7E93" IsHitTestVisible="False"><TextBlock.Style><Style TargetType="TextBlock"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding Text, ElementName=SearchBox}" Value=""><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></TextBlock.Style></TextBlock>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                    <ComboBox x:Name="SearchScopeBox" AutomationProperties.AutomationId="SearchScopeBox" AutomationProperties.Name="검색할 곳" Width="142" Height="36" Margin="0,0,6,0" ItemsSource="{Binding SearchScopes}" SelectedIndex="0" ToolTip="검색할 곳" SelectionChanged="SearchScope_Changed"/>
+                    <TextBox x:Name="SearchBox" Grid.Column="1" AutomationProperties.AutomationId="SearchBox" Height="36" VerticalContentAlignment="Center" ToolTip="띄어쓰기: 모두 포함 · A OR B: 하나 이상 · -단어: 제외 · &quot;문구&quot;: 그대로 · ext:pdf size:&gt;1mb date:7d · Ctrl+F" AutomationProperties.Name="파일 이름 또는 내용 검색어" KeyDown="SearchBox_KeyDown"/>
+                    <TextBlock Grid.Column="1" Text="{Binding SelectedItem.Label, ElementName=SearchModeBox, StringFormat={}{0} 검색}" Margin="10,0" VerticalAlignment="Center" Foreground="#6B7E93" IsHitTestVisible="False"><TextBlock.Style><Style TargetType="TextBlock"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding Text, ElementName=SearchBox}" Value=""><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></TextBlock.Style></TextBlock>
                 </Grid>
                 <Button x:Name="SearchButton" Grid.Column="7" Background="#176BA0" Foreground="White" BorderBrush="#176BA0" Margin="6,0,0,0" Padding="10,0" Style="{StaticResource ActionButton}" Content="검색" ToolTip="{Binding SelectedItem.Label, ElementName=SearchModeBox, StringFormat={}{0} 검색 · Enter}" Click="Search_Click"/>
                 <Button x:Name="SearchCancelButton" Grid.Column="8" Style="{StaticResource CancelActionButton}" Padding="10,0" Content="취소" IsEnabled="False" Margin="6,0,0,0" Click="SearchCancel_Click"/>

@@ -81,6 +81,12 @@ public sealed record DriveItem(string Label, string Path)
     public override string ToString() => Label;
 }
 
+/// <summary>Where a search looks: the selected location, or every local drive.</summary>
+public sealed record SearchScopeChoice(string Label, bool AllDrives)
+{
+    public override string ToString() => Label;
+}
+
 public sealed record SearchModeChoice(string Label, SearchMode Mode)
 {
     public override string ToString() => Label;

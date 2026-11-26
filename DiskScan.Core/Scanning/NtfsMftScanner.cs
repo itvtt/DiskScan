@@ -387,7 +387,6 @@ internal static class NtfsMftScanner
                 stack.Push((node, true));
                 foreach (var child in node.Children)
                 {
-                    child.FullPath = Path.Combine(node.FullPath, child.Name);
                     if (child.IsDirectory)
                         stack.Push((child, false));
                 }

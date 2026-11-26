@@ -89,6 +89,22 @@ await Check("scan totals, nested folders, empty folders, Unicode and system usag
     Assert(scan.Root.Size == actual && scan.Root.FileCount == 4, "Root totals mismatch");
     Assert(scan.Root.Children.Any(node => node.Name == "empty" && node.IsDirectory && node.Size == 0), "Empty folder missing");
     Assert(scan.Files.All(node => node.Parent != null && File.Exists(node.FullPath)), "Parent/path reconstruction failed");
+    var builtPaths = new List<string>();
+    var pathStack = new Stack<ScanNode>(scan.Root.Children);
+    while (pathStack.TryPop(out var pathNode))
+    {
+        builtPaths.Add(pathNode.FullPath);
+        foreach (var child in pathNode.Children) pathStack.Push(child);
+    }
+    Assert(builtPaths.Order(StringComparer.Ordinal).SequenceEqual(
+            Directory.EnumerateFileSystemEntries(smallRoot, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal)),
+        "Paths built from the parent and name differ from the file system");
+    var pathRoot = new ScanNode { Name = @"C:\", FullPath = @"C:\", IsDirectory = true };
+    var pathFolder = new ScanNode { Name = "a", IsDirectory = true, Parent = pathRoot };
+    var pathLeaf = new ScanNode { Name = "b.txt", Parent = pathFolder };
+    Assert(pathFolder.FullPath == @"C:\a" && pathLeaf.FullPath == @"C:\a\b.txt", "Paths below a drive root are built without doubled separators");
+    pathLeaf.FullPath = @"D:\moved\b.txt";
+    Assert(pathLeaf.FullPath == @"D:\moved\b.txt", "A path that is set is kept");
     Assert(scan.Root.Children.Single(node => node.Name == "a").Size == 3 + Encoding.UTF8.GetByteCount("가나다라마바사"), "Nested total mismatch");
     Assert(scan.Summary.Elapsed >= TimeSpan.Zero && !string.IsNullOrWhiteSpace(scan.Summary.Mode), "Scan metadata missing");
 });

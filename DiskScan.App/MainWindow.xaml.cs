@@ -51,6 +51,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const int MaxSearchResults = 10000;
     // A file list older than this is read again before searching, so new files are found.
     private static readonly TimeSpan ScanFreshFor = TimeSpan.FromMinutes(5);
+    // File lists read for "모든 드라이브": kept while fresh so the next search starts at once,
+    // and reads still running when a newer search replaces the old one, so it can reuse them.
+    private readonly Dictionary<string, (ScanResult Scan, DateTime ListedUtc)> _driveLists = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DriveListRead> _driveListReads = new(StringComparer.OrdinalIgnoreCase);
+    private CancellationTokenSource _driveListCancellation = new();
+    private DispatcherTimer? _driveListExpiry;
     private IReadOnlyList<DuplicateFileRow> _duplicateRows = [];
     private IReadOnlyList<DuplicateGroup> _duplicateGroups = [];
     private IReadOnlyList<string> _duplicateFailures = [];
@@ -65,6 +71,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _duplicateDeletionService = new DuplicateDeletionService(duplicateRecycler);
         _duplicateConfirmation = duplicateConfirmation;
         SearchModes = [new("파일 이름", SearchMode.FileName), new("파일 내용", SearchMode.Contents), new("이름 또는 내용", SearchMode.NameOrContents)];
+        SearchScopes = [new("선택한 위치", false), new("모든 드라이브", true)];
         KindChoices =
         [
             new("전체", ""), new("폴더", "type:folder"),
@@ -85,7 +92,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         Loaded += MainWindow_Loaded;
         PreviewKeyDown += Window_PreviewKeyDown;
         Closing += MainWindow_Closing;
-        Closing += (_, _) => { _scanCancellation?.Cancel(); _searchCancellation?.Cancel(); _duplicateCancellation?.Cancel(); Interlocked.Increment(ref _duplicateGeneration); };
+        Closing += (_, _) => { _scanCancellation?.Cancel(); _searchCancellation?.Cancel(); _driveListCancellation.Cancel(); _duplicateCancellation?.Cancel(); Interlocked.Increment(ref _duplicateGeneration); };
         StateChanged += (_, _) => MaximizeButton.Content = WindowState == WindowState.Maximized ? "❐" : "□";
     }
 
@@ -101,6 +108,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public IReadOnlyList<DuplicateFileRow> DuplicateRows { get => _duplicateRows; private set => Set(ref _duplicateRows, value); }
     public IReadOnlyList<string> DuplicateFailures { get => _duplicateFailures; private set => Set(ref _duplicateFailures, value); }
     public IReadOnlyList<SearchModeChoice> SearchModes { get; }
+    public IReadOnlyList<SearchScopeChoice> SearchScopes { get; }
+    /// <summary>What "모든 드라이브" searches: the local fixed and removable drives (not network drives or discs).</summary>
+    public Func<IReadOnlyList<string>> SearchDriveRoots { get; set; } = LocalDriveRoots;
     public IReadOnlyList<ConditionChoice> KindChoices { get; }
     public IReadOnlyList<ConditionChoice> SizeChoices { get; }
     public IReadOnlyList<ConditionChoice> DateChoices { get; }
@@ -201,6 +211,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
         SearchStatusText.ClearValue(ToolTipProperty);
+        if (SearchScopeBox.SelectedItem is SearchScopeChoice { AllDrives: true })
+        {
+            await SearchAllDrivesAsync(query, mode, conditions);
+            return;
+        }
         string requestedPath;
         try { requestedPath = Path.GetFullPath(Environment.ExpandEnvironmentVariables(PathBox.Text.Trim().Trim('"'))); }
         catch { SearchStatusText.Text = "위에서 검색할 드라이브나 폴더를 선택하세요."; return; }
@@ -301,6 +316,242 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    /// <summary>
+    /// Searches every drive. Each drive is searched as soon as its file list is ready (a fresh
+    /// list is reused), so results from quick drives appear while slower ones are still read.
+    /// The analysis on screen is left as it is.
+    /// </summary>
+    private async Task SearchAllDrivesAsync(string query, SearchMode mode, string conditions)
+    {
+        var drives = SearchDriveRoots().Select(FolderKey).Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(root => new DriveSearch(root)).ToArray();
+        if (drives.Length == 0) { SearchStatusText.Text = "검색할 드라이브가 없습니다."; return; }
+
+        var generation = Interlocked.Increment(ref _searchGeneration);
+        _searchCancellation?.Cancel();
+        _searchCancellation?.Dispose();
+        _searchCancellation = new();
+        var token = _searchCancellation.Token;
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        SearchButton.IsEnabled = false; SearchCancelButton.IsEnabled = true;
+        FindDuplicatesButton.IsEnabled = false;
+        BusyProgress.Visibility = Visibility.Visible;
+        var conditionNote = conditions.Length > 0 ? "조건 적용 · " : "";
+        var started = Stopwatch.StartNew();
+        var options = new SearchOptions(query, mode, MatchCaseBox.IsChecked == true, MaxSearchResults, conditions);
+
+        var rows = new ObservableCollection<SearchResultRow>();
+        SearchResults = rows;
+        var pending = new ConcurrentQueue<IReadOnlyList<SearchHit>>();
+        var limitReached = false;
+        var acceptingProgress = true;
+        void Drain()
+        {
+            if (generation != _searchGeneration) return;
+            var batch = new List<SearchResultRow>();
+            while (!limitReached && pending.TryDequeue(out var hits))
+                foreach (var hit in hits)
+                {
+                    if (rows.Count + batch.Count >= MaxSearchResults) { limitReached = true; break; }
+                    batch.Add(new SearchResultRow(hit));
+                }
+            if (limitReached) stop.Cancel();
+            if (batch.Count == 0) return;
+            if (rows.Count == 0) { rows = new ObservableCollection<SearchResultRow>(batch); SearchResults = rows; }
+            else foreach (var row in batch) rows.Add(row);
+        }
+        void ShowProgress()
+        {
+            if (!acceptingProgress || generation != _searchGeneration) return;
+            var parts = new List<string> { $"결과 {rows.Count:N0}개", $"드라이브 {drives.Count(drive => drive.Done)}/{drives.Length} 완료" };
+            var listing = drives.Where(drive => drive.Read is not null).ToArray();
+            if (listing.Length > 0)
+                parts.Add($"{string.Join(" ", listing.Select(drive => drive.Label))} 파일 목록 읽는 중 {listing.Sum(drive => drive.Read?.Files ?? 0):N0}개");
+            var total = drives.Sum(drive => drive.Total);
+            if (total > 0) parts.Add($"파일 내용 {drives.Sum(drive => drive.Examined):N0} / {total:N0} 확인 중");
+            SearchStatusText.Text = conditionNote + string.Join(" · ", parts) + "…";
+        }
+        var drainTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(150), DispatcherPriority.Background, (_, _) => { Drain(); ShowProgress(); }, Dispatcher);
+
+        async Task SearchDrive(DriveSearch drive)
+        {
+            try
+            {
+                var scan = await DriveListAsync(drive, stop.Token);
+                var nodes = await Task.Run(() => Descendants(scan.Root), stop.Token);
+                var progress = new Progress<SearchProgress>(p => { drive.Examined = p.Examined; drive.Total = p.Total; });
+                var report = await _searchService.SearchAsync(nodes, options, progress, stop.Token, new QueueProgress(pending));
+                drive.ContentFiles = report.ContentFiles;
+                drive.LimitReached = report.LimitReached;
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested) { drive.ContentFiles = drive.Examined; }
+            catch (Exception error) { drive.Error = error.Message; }
+            finally { drive.Done = true; }
+        }
+
+        try
+        {
+            drainTimer.Start();
+            ShowProgress();
+            await Task.WhenAll(drives.Select(SearchDrive));
+            token.ThrowIfCancellationRequested();
+            if (generation != _searchGeneration) return;
+            Drain();
+            acceptingProgress = false;
+            ILuncher.AppKit.AppUsage.Count("search");
+            var searched = drives.Where(drive => drive.Error is null).ToArray();
+            var failed = drives.Where(drive => drive.Error is not null).ToArray();
+            var parts = new List<string> { $"결과 {rows.Count:N0}개" };
+            if (limitReached || drives.Any(drive => drive.LimitReached)) parts.Add($"최대 {MaxSearchResults:N0}개까지 표시");
+            if (searched.Length > 0) parts.Add("드라이브 " + string.Join(" ", searched.Select(drive => drive.Label)));
+            var contentFiles = drives.Sum(drive => drive.ContentFiles);
+            if (contentFiles > 0) parts.Add($"파일 내용 {contentFiles:N0}개 확인");
+            parts.Add(Format.Duration(started.Elapsed));
+            if (failed.Length > 0) parts.Add($"{string.Join(" ", failed.Select(drive => drive.Label))} 읽지 못함");
+            var listed = searched.Where(drive => drive.ListedUtc != default).Select(drive => drive.ListedUtc).ToArray();
+            if (listed.Length > 0 && DateTime.UtcNow - listed.Min() > TimeSpan.FromMinutes(1)) parts.Add($"{listed.Min().ToLocalTime():HH:mm} 파일 목록 기준");
+            SearchStatusText.Text = conditionNote + string.Join(" · ", parts);
+            if (failed.Length > 0) SearchStatusText.ToolTip = string.Join(Environment.NewLine, failed.Select(drive => $"{drive.Label} {drive.Error}"));
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            if (generation == _searchGeneration)
+            {
+                Drain();
+                SearchStatusText.Text = $"검색을 취소했습니다 · 그때까지 찾은 결과 {SearchResults.Count:N0}개";
+            }
+        }
+        catch (Exception ex)
+        {
+            if (generation == _searchGeneration) SearchStatusText.Text = $"검색하지 못했습니다: {ex.Message}";
+        }
+        finally
+        {
+            drainTimer.Stop();
+            acceptingProgress = false;
+            if (generation == _searchGeneration)
+            {
+                SearchButton.IsEnabled = ScanButton.IsEnabled; SearchCancelButton.IsEnabled = false;
+                FindDuplicatesButton.IsEnabled = ScanButton.IsEnabled && !_duplicatePipelineActive;
+                if (_scanCancellation is null || _scanCancellation.IsCancellationRequested || ScanButton.IsEnabled) BusyProgress.Visibility = Visibility.Collapsed;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A fresh file list for one drive: the analysis on screen, a kept list, or a new read.
+    /// A new read goes on when a newer search replaces this one, so that search reuses it.
+    /// </summary>
+    private async Task<ScanResult> DriveListAsync(DriveSearch drive, CancellationToken token)
+    {
+        if (CurrentScan is { } current && SameFolder(current.Root.FullPath, drive.Root) && DateTime.UtcNow - _scanCompletedUtc <= ScanFreshFor)
+        {
+            drive.ListedUtc = _scanCompletedUtc;
+            return current;
+        }
+        if (_driveLists.TryGetValue(drive.Root, out var kept) && DateTime.UtcNow - kept.ListedUtc <= ScanFreshFor)
+        {
+            drive.ListedUtc = kept.ListedUtc;
+            return kept.Scan;
+        }
+        if (!_driveListReads.TryGetValue(drive.Root, out var read))
+        {
+            _driveLists.Remove(drive.Root); // let the old list go before reading a new one
+            read = new DriveListRead();
+            _driveListReads[drive.Root] = read;
+            read.Task = ReadDriveListAsync(drive.Root, read, _driveListCancellation.Token);
+        }
+        drive.Read = read;
+        try
+        {
+            var scan = await read.Task.WaitAsync(token);
+            drive.ListedUtc = DateTime.UtcNow;
+            return scan;
+        }
+        finally { drive.Read = null; }
+    }
+
+    private async Task<ScanResult> ReadDriveListAsync(string root, DriveListRead read, CancellationToken token)
+    {
+        try
+        {
+            var scan = await new DiskScanner().ScanAsync(root, new Progress<ScanProgress>(p => read.Files = p.Files), token);
+            _driveLists[root] = (scan, DateTime.UtcNow);
+            _driveListExpiry ??= new DispatcherTimer(TimeSpan.FromMinutes(1), DispatcherPriority.Background, (_, _) => ExpireDriveLists(), Dispatcher);
+            _driveListExpiry.Start();
+            return scan;
+        }
+        finally
+        {
+            if (_driveListReads.TryGetValue(root, out var current) && ReferenceEquals(current, read)) _driveListReads.Remove(root);
+        }
+    }
+
+    /// <summary>Old lists would be read again before the next search anyway, so their memory is returned.</summary>
+    private void ExpireDriveLists()
+    {
+        foreach (var root in _driveLists.Where(pair => DateTime.UtcNow - pair.Value.ListedUtc > ScanFreshFor).Select(pair => pair.Key).ToArray())
+            _driveLists.Remove(root);
+        if (_driveLists.Count == 0) _driveListExpiry?.Stop();
+    }
+
+    private void CancelDriveListReads()
+    {
+        if (_driveListReads.Count == 0) return;
+        _driveListCancellation.Cancel();
+        _driveListCancellation = new();
+    }
+
+    private static IReadOnlyList<string> LocalDriveRoots()
+    {
+        try
+        {
+            return DriveInfo.GetDrives()
+                .Where(drive => drive.DriveType is DriveType.Fixed or DriveType.Removable && drive.IsReady)
+                .Select(drive => drive.RootDirectory.FullName).ToArray();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return []; }
+    }
+
+    private string IdleSearchStatus()
+    {
+        if (SearchScopeBox?.SelectedItem is not SearchScopeChoice { AllDrives: true }) return "선택한 위치의 이름과 내용을 검색합니다";
+        var labels = SearchDriveRoots().Select(root => DriveLabel(FolderKey(root)));
+        return $"모든 드라이브({string.Join(" ", labels)})의 이름과 내용을 검색합니다";
+    }
+
+    private void SearchScope_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (SearchStatusText is null || SearchCancelButton is null || SearchCancelButton.IsEnabled) return;
+        SearchStatusText.ClearValue(ToolTipProperty);
+        SearchStatusText.Text = IdleSearchStatus();
+    }
+
+    private static string FolderKey(string path) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+    private static bool SameFolder(string first, string second) => string.Equals(FolderKey(first), FolderKey(second), StringComparison.OrdinalIgnoreCase);
+    private static string DriveLabel(string root) => root.Length <= 3 ? root.TrimEnd('\\') : Path.GetFileName(root);
+
+    private sealed class DriveListRead
+    {
+        public Task<ScanResult> Task { get; set; } = null!;
+        public long Files;
+    }
+
+    /// <summary>One drive of a "모든 드라이브" search, updated on the UI thread.</summary>
+    private sealed class DriveSearch(string root)
+    {
+        public string Root { get; } = root;
+        public string Label { get; } = DriveLabel(root);
+        public DriveListRead? Read { get; set; }
+        public DateTime ListedUtc { get; set; }
+        public long Examined { get; set; }
+        public long Total { get; set; }
+        public long ContentFiles { get; set; }
+        public bool LimitReached { get; set; }
+        public bool Done { get; set; }
+        public string? Error { get; set; }
+    }
+
     /// <summary>The scanned folder for a path inside the current analysis, or null.</summary>
     private static ScanNode? FindScope(ScanResult? scan, string path)
     {
@@ -367,6 +618,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void ApplyScan(ScanResult scan, PreparedScan prepared, bool useAllocated)
     {
         CurrentScan = scan;
+        _driveLists.Remove(FolderKey(scan.Root.FullPath)); // the new analysis is the fresher list
         _useAllocated = useAllocated;
         _settingMetric = true;
         MetricBox.SelectedItem = MetricChoices[useAllocated ? 1 : 0];
@@ -383,7 +635,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         Extensions = prepared.Extensions;
         SearchResults = [];
         _scanCompletedUtc = DateTime.UtcNow;
-        SearchStatusText.Text = "선택한 위치의 이름과 내용을 검색합니다";
+        SearchStatusText.Text = IdleSearchStatus();
         _navigation.Clear();
         ShowFolder(scan.Root, false);
 
@@ -762,6 +1014,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         PathBox.IsEnabled = !busy;
         BrowseButton.IsEnabled = !busy;
         SearchBox.IsEnabled = !busy;
+        SearchScopeBox.IsEnabled = !busy;
         SearchModeBox.IsEnabled = !busy;
         MatchCaseBox.IsEnabled = !busy;
         SearchButton.IsEnabled = !busy;
@@ -849,7 +1102,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void SetScanBusy(bool busy)
     {
         ScanButton.IsEnabled = !busy; CancelButton.IsEnabled = busy; DriveBox.IsEnabled = !busy; PathBox.IsEnabled = !busy; BrowseButton.IsEnabled = !busy;
-        SearchBox.IsEnabled = !busy; SearchModeBox.IsEnabled = !busy; MatchCaseBox.IsEnabled = !busy; SearchButton.IsEnabled = !busy; SearchCancelButton.IsEnabled = false; MetricBox.IsEnabled = !busy;
+        SearchBox.IsEnabled = !busy; SearchScopeBox.IsEnabled = !busy; SearchModeBox.IsEnabled = !busy; MatchCaseBox.IsEnabled = !busy; SearchButton.IsEnabled = !busy; SearchCancelButton.IsEnabled = false; MetricBox.IsEnabled = !busy;
         FindDuplicatesButton.IsEnabled = !busy && !_duplicatePipelineActive; CancelDuplicatesButton.IsEnabled = busy && _duplicatePipelineActive;
         DuplicateGrid.IsEnabled = !busy;
         OpenDuplicateFolderButton.IsEnabled = !busy && DuplicateGrid.SelectedItem is DuplicateFileRow;
@@ -872,7 +1125,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ClearTypeHighlightButton.Visibility = extension is null ? Visibility.Collapsed : Visibility.Visible;
     }
     private void ClearTypeHighlight_Click(object sender, RoutedEventArgs e) => ExtensionGrid.SelectedItem = null;
-    private void SearchCancel_Click(object sender, RoutedEventArgs e) => _searchCancellation?.Cancel();
+    private void SearchCancel_Click(object sender, RoutedEventArgs e) { _searchCancellation?.Cancel(); CancelDriveListReads(); }
     private async void FindDuplicates_Click(object sender, RoutedEventArgs e) => await FindDuplicatesAsync();
     private void CancelDuplicates_Click(object sender, RoutedEventArgs e) => CancelDuplicatePipeline();
     private void CancelDuplicatePipeline()
@@ -918,7 +1171,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             OptionsToggle.IsChecked = false;
             if (CancelButton.IsEnabled) _scanCancellation?.Cancel();
-            if (SearchCancelButton.IsEnabled) _searchCancellation?.Cancel();
+            if (SearchCancelButton.IsEnabled) { _searchCancellation?.Cancel(); CancelDriveListReads(); }
             if (CancelDuplicatesButton.IsEnabled) CancelDuplicatePipeline();
             e.Handled = true;
         }

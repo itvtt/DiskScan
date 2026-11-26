@@ -2,8 +2,20 @@ namespace DiskScan.Core;
 
 public sealed class ScanNode
 {
+    private string? _fullPath;
+
     public string Name { get; set; } = "";
-    public string FullPath { get; set; } = "";
+
+    /// <summary>
+    /// The item's path. Scanners store it only on the scanned root; below that it is built from
+    /// the parent's path and the name when asked, so a drive of a million files does not keep a
+    /// copy of every folder path per file. A path that is set is returned as set.
+    /// </summary>
+    public string FullPath
+    {
+        get => _fullPath ?? ComposePath();
+        set => _fullPath = value;
+    }
     public bool IsDirectory { get; set; }
     public long Size { get; set; }
     public long AllocatedSize { get; set; }
@@ -13,6 +25,31 @@ public sealed class ScanNode
     public List<ScanNode> Children { get; } = [];
     public long FileCount { get; set; }
     public string Extension => IsDirectory ? "" : Path.GetExtension(Name).ToLowerInvariant();
+
+    private string ComposePath()
+    {
+        if (Parent is null) return "";
+        var length = 0;
+        var anchor = this;
+        while (anchor._fullPath is null && anchor.Parent is not null)
+        {
+            length += anchor.Name.Length + 1;
+            anchor = anchor.Parent;
+        }
+        var basePath = anchor._fullPath ?? "";
+        if (basePath.Length == 0 || basePath[^1] is '\\' or '/') length--; // no separator after the base
+        return string.Create(basePath.Length + length, (Leaf: this, Anchor: anchor, Base: basePath), static (span, state) =>
+        {
+            var end = span.Length;
+            for (var node = state.Leaf; !ReferenceEquals(node, state.Anchor); node = node.Parent!)
+            {
+                end -= node.Name.Length;
+                node.Name.AsSpan().CopyTo(span[end..]);
+                if (end > state.Base.Length) span[--end] = '\\';
+            }
+            state.Base.AsSpan().CopyTo(span);
+        });
+    }
 }
 
 public sealed record ScanProgress(long Files, long Directories, long Bytes, string CurrentPath, string Mode, TimeSpan Elapsed);

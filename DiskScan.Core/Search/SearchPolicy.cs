@@ -62,6 +62,10 @@ public static class SearchPolicy
     };
 
     private static readonly string[] KnownOperatingSystemRoots = GetKnownOperatingSystemRoots();
+    // Folder names of those roots: only folders with one of these names need their path built.
+    private static readonly HashSet<string> KnownOperatingSystemRootNames = new(
+        KnownOperatingSystemRoots.Select(Path.GetFileName).OfType<string>().Where(static name => name.Length > 0),
+        StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// True when the item's contents must not be read: system files, protected
@@ -148,7 +152,7 @@ public static class SearchPolicy
                 result = parent | FromAttributes(node);
                 if (IsVolumeRoot(node.Parent))
                     result |= FromRootLevelName(node);
-                else if (node.IsDirectory && IsKnownOperatingSystemRoot(node.FullPath))
+                else if (node.IsDirectory && KnownOperatingSystemRootNames.Contains(node.Name) && IsKnownOperatingSystemRoot(node.FullPath))
                     result |= Eligibility.ContentExcluded | Eligibility.OperatingSystem;
                 if (node.IsDirectory && NoisyDirectoryNames.Contains(node.Name))
                     result |= Eligibility.Noisy;
@@ -215,6 +219,9 @@ public static class SearchPolicy
 
     private static bool IsVolumeRoot(ScanNode node)
     {
+        // Only the top of a scan can be a drive root; checking that first saves building a path per file.
+        if (node.Parent is not null)
+            return false;
         string path = node.FullPath;
         if (string.IsNullOrEmpty(path))
             return false;
