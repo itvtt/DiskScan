@@ -49,7 +49,16 @@ public static class SearchPolicy
     private static readonly HashSet<string> NoisyDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "bin", "obj", "node_modules", ".git", ".svn", ".hg", ".vs", ".idea", "__pycache__",
-        "packages", ".nuget", ".cache", "AppData", "Temp", "tmp", "$Recycle.Bin"
+        "packages", ".nuget", ".cache", "AppData", "Temp", "tmp", "$Recycle.Bin",
+        "bower_components", "site-packages", ".venv"
+    };
+
+    // Downloaded libraries and version-control internals: found by name, but their
+    // contents are not read unless the search starts inside one (as VS Code excludes
+    // node_modules and .git from search by default).
+    private static readonly HashSet<string> DependencyDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "node_modules", "bower_components", ".git", ".svn", ".hg", "__pycache__", "site-packages", ".venv"
     };
 
     private static readonly string[] KnownOperatingSystemRoots = GetKnownOperatingSystemRoots();
@@ -103,7 +112,8 @@ public static class SearchPolicy
         HiddenFromNames = 1,
         ContentExcluded = 2,
         OperatingSystem = 4,
-        Noisy = 8
+        Noisy = 8,
+        Dependency = 16
     }
 
     /// <summary>
@@ -142,6 +152,8 @@ public static class SearchPolicy
                     result |= Eligibility.ContentExcluded | Eligibility.OperatingSystem;
                 if (node.IsDirectory && NoisyDirectoryNames.Contains(node.Name))
                     result |= Eligibility.Noisy;
+                if (node.IsDirectory && DependencyDirectoryNames.Contains(node.Name))
+                    result |= Eligibility.Dependency;
             }
 
             if (node.IsDirectory)
@@ -193,10 +205,9 @@ public static class SearchPolicy
             for (int index = 0; index < directorySegments; index++)
             {
                 if (NoisyDirectoryNames.Contains(segments[index]))
-                {
                     result |= Eligibility.Noisy;
-                    break;
-                }
+                if (DependencyDirectoryNames.Contains(segments[index]))
+                    result |= Eligibility.Dependency;
             }
             return result;
         }

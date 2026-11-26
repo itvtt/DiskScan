@@ -208,6 +208,18 @@ public sealed class ContentSearchService
             flags[index] = cache.Get(nodes[index]);
         }
 
+        // Library and version-control folders are not read unless the whole search is
+        // inside one (the user picked such a folder on purpose).
+        bool insideDependency = nodes.Count > 0 && Array.TrueForAll(flags, flag => (flag & SearchPolicy.Eligibility.Dependency) != 0);
+        if (!insideDependency)
+        {
+            for (int index = 0; index < flags.Length; index++)
+            {
+                if ((flags[index] & SearchPolicy.Eligibility.Dependency) != 0)
+                    flags[index] |= SearchPolicy.Eligibility.ContentExcluded;
+            }
+        }
+
         var outcomes = new NameOutcome[nodes.Count];
         Parallel.For(0, nodes.Count, new ParallelOptions { CancellationToken = cancellationToken }, index =>
         {

@@ -524,6 +524,27 @@ await Check("PDF text: simple fonts, Flate streams with ToUnicode CID fonts, enc
     Assert(glued.Hits.Count == 1, "Text drawn as separate touching objects must read as one word, gaps and new lines as one space");
 });
 
+await Check("library and .git folders: found by name, contents read only when searched from inside", async () =>
+{
+    var project = Path.GetFullPath(Write("deps/app/notes.txt", "DependencyNeedle in my notes"));
+    var library = Path.GetFullPath(Write("deps/app/node_modules/lib/index.js", "DependencyNeedle in a library"));
+    Write("deps/app/.git/config", "DependencyNeedle in git config");
+    var scan = await scanner.ScanAsync(Path.Combine(fixture, "deps"));
+    var everything = new List<ScanNode>();
+    var pending = new Stack<ScanNode>(scan.Root.Children);
+    while (pending.Count > 0) { var node = pending.Pop(); everything.Add(node); foreach (var child in node.Children) pending.Push(child); }
+    var whole = await search.SearchAsync(everything, new SearchOptions("DependencyNeedle", SearchMode.Contents));
+    Assert(whole.Hits.Count == 1 && whole.Hits[0].Node.FullPath == project, "Library/.git contents were read from an ordinary search: " + string.Join(", ", whole.Hits.Select(hit => hit.Node.FullPath)));
+    var byName = await search.SearchAsync(everything, new SearchOptions("index.js", SearchMode.FileName));
+    Assert(byName.Hits.Count == 1, "Files in node_modules must still be found by name");
+    var modules = everything.First(node => node.Name == "node_modules");
+    var inside = new List<ScanNode>();
+    pending = new Stack<ScanNode>(modules.Children);
+    while (pending.Count > 0) { var node = pending.Pop(); inside.Add(node); foreach (var child in node.Children) pending.Push(child); }
+    var chosen = await search.SearchAsync(inside, new SearchOptions("DependencyNeedle", SearchMode.Contents));
+    Assert(chosen.Hits.Count == 1 && chosen.Hits[0].Node.FullPath == library, "Searching inside node_modules must read its contents");
+});
+
 await Check("name hits stream first and content hits follow in NameOrContents mode", async () =>
 {
     var named = Write("stream/StreamNeedle-name.txt", "nothing here");
